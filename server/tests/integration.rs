@@ -664,6 +664,95 @@ async fn rate_limit_kicks_in() {
 }
 
 #[tokio::test]
+async fn late_joiner_never_pauses_or_delays_others() {
+    // Long barrier timeout so a wait on the joiner would be obvious.
+    let cfg = Config {
+        barrier_timeout: Duration::from_secs(5),
+        ..fast_cfg()
+    };
+    let (url, _) = start(cfg).await;
+    let mut a = Client::join(&url, "kasni", "Ana", None).await.unwrap();
+    a.add(
+        "https://youtu.be/aaaaaaaaaaa",
+        vec![track("aaaaaaaaaaa", Some(200_000))],
+    )
+    .await;
+    let st = a.wait_state("loading", |s| s.waiting_for_ready).await;
+
+    // Bojan joins while the track is still loading for Ana.
+    let mut b = Client::join(&url, "kasni", "Bojan", None).await.unwrap();
+    assert!(b.state.waiting_for_ready);
+    let t0 = Instant::now();
+    a.send(ClientMsg::Ready {
+        version: st.playback.version,
+    })
+    .await;
+    let st = a
+        .wait_state("playing", |s| s.playback.status == PlayStatus::Playing)
+        .await;
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "Ana must not wait for Bojan to load"
+    );
+    b.wait_state("playing for Bojan", |s| {
+        s.playback.status == PlayStatus::Playing
+    })
+    .await;
+
+    // Ceca joins mid-song: playback for Ana and Bojan is left untouched.
+    let version = st.playback.version;
+    let anchor = (st.playback.anchor_server_ms, st.playback.anchor_position_ms);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let c = Client::join(&url, "kasni", "Ceca", None).await.unwrap();
+    assert_eq!(c.state.playback.status, PlayStatus::Playing);
+    assert_eq!(c.state.playback.version, version);
+    a.drain(Duration::from_millis(300)).await;
+    b.drain(Duration::from_millis(10)).await;
+    for (who, s) in [("Ana", &a.state), ("Bojan", &b.state)] {
+        assert_eq!(s.playback.status, PlayStatus::Playing, "{who} was paused");
+        assert_eq!(s.playback.version, version, "{who}'s playback changed");
+        assert_eq!(
+            (s.playback.anchor_server_ms, s.playback.anchor_position_ms),
+            anchor,
+            "{who}'s position moved"
+        );
+        assert!(!s.waiting_for_ready);
+    }
+}
+
+#[tokio::test]
+async fn empty_room_pauses_and_does_not_advance() {
+    let (url, _) = start(fast_cfg()).await;
+    let mut a = Client::join(&url, "tisina", "Ana", None).await.unwrap();
+    a.add(
+        "https://youtu.be/aaaaaaaaaaa",
+        vec![
+            track("aaaaaaaaaaa", Some(600)),
+            track("bbbbbbbbbbb", Some(600)),
+        ],
+    )
+    .await;
+    let st = a.wait_state("loading", |s| s.waiting_for_ready).await;
+    a.send(ClientMsg::Ready {
+        version: st.playback.version,
+    })
+    .await;
+    a.wait_state("playing", |s| s.playback.status == PlayStatus::Playing)
+        .await;
+    a.send(ClientMsg::Leave).await;
+    drop(a);
+
+    // Well past the track end + grace, but before the room TTL.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let b = Client::join(&url, "tisina", "Bojan", None).await.unwrap();
+    let p = &b.state.playback;
+    assert_eq!(p.status, PlayStatus::Paused);
+    assert_eq!(p.track_index, Some(0), "server must not auto-advance");
+    assert!(p.anchor_position_ms < 600, "position must be held");
+    assert!(!b.state.waiting_for_ready);
+}
+
+#[tokio::test]
 async fn ping_pong_and_empty_room_cleanup() {
     let (url, _) = start(fast_cfg()).await;
     let mut a = Client::join(&url, "prazna", "Ana", Some("x"))

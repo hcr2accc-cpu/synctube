@@ -29,11 +29,26 @@ pub struct Mpv {
     next_id: AtomicU64,
 }
 
+/// Loudness normalization: every song is brought to about -14 LUFS (what
+/// YouTube targets), so quiet songs get louder and loud ones quieter. The
+/// filter keeps timestamps, so it does not shift playback or sync.
+const NORMALIZE_FILTER: &str = "lavfi=[loudnorm=I=-14:TP=-1.5:LRA=11]";
+
+/// mpv's `af` value for the normalization setting.
+pub fn audio_filter(normalize: bool) -> &'static str {
+    if normalize {
+        NORMALIZE_FILTER
+    } else {
+        ""
+    }
+}
+
 impl Mpv {
     /// Starts mpv and connects to its IPC pipe.
     pub async fn spawn(
         mpv: &Path,
         volume: f64,
+        normalize: bool,
         events: mpsc::UnboundedSender<PlayerEvent>,
     ) -> Result<Self, String> {
         let pipe_name = ipc_name();
@@ -53,6 +68,7 @@ impl Mpv {
             "--load-scripts=no",
             "--osc=no",
             "--hr-seek=yes",
+            &format!("--af={}", audio_filter(normalize)),
         ]);
         cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());

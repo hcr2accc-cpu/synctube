@@ -107,6 +107,7 @@ fn main() {
         fake_rate: args.fake_rate,
         tools: Tools::discover(),
         volume: args.volume,
+        normalize: false,
         auto_update: !args.no_update && !args.fake_audio,
     };
     let handle = engine::start(cfg, Arc::new(|| {}));

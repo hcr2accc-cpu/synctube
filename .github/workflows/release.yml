@@ -1,0 +1,93 @@
+# Builds Windows and Linux clients for a version tag (e.g. v0.1) and
+# publishes them together as one GitHub release with that name.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p client --bin synctube
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/release/synctube.exe
+
+  linux:
+    # Older Ubuntu = older glibc, so the binary runs on more distributions.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: System libraries
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -o Acquire::Retries=3 &&
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
+              libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+              libxrandr-dev libxi-dev libgl1-mesa-dev && break
+            sleep 20
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked -p client --bin synctube
+      - name: Package
+        run: |
+          mkdir -p pkg/synctube
+          cp target/release/synctube pkg/synctube/
+          strip pkg/synctube/synctube
+          cp LINUX.md pkg/synctube/README.md
+          tar -C pkg -czf synctube-linux-x86_64.tar.gz synctube
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: synctube-linux-x86_64.tar.gz
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --verify-tag --title "SyncTube $TAG" --notes "$(cat <<'EOF'
+          SyncTube za Windows i Linux.
+
+          - **Windows**: preuzmi `synctube.exe` i pokreni ga.
+          - **Linux**: preuzmi `synctube-linux-x86_64.tar.gz`, raspakuj ga i pročitaj README.md (treba mpv iz sistema).
+
+          Adresu servera dobijaš privatno od onoga ko te poziva u sobu.
+          EOF
+          )"
+          gh release upload "$TAG" out/synctube.exe out/synctube-linux-x86_64.tar.gz --clobber

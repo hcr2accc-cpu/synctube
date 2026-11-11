@@ -81,6 +81,20 @@ impl Player {
         }
     }
 
+    pub async fn set_normalize(&self, on: bool) {
+        match self {
+            Player::Mpv(m) => {
+                if let Err(e) = m
+                    .set_property("af", json!(crate::mpv::audio_filter(on)))
+                    .await
+                {
+                    tracing::warn!("cannot set audio filter: {e}");
+                }
+            }
+            Player::Fake(f) => f.state.lock().unwrap().normalize = on,
+        }
+    }
+
     /// Current position and the local time (ms) it refers to.
     pub async fn position(&self) -> Option<(u64, u64)> {
         match self {
@@ -121,6 +135,7 @@ pub struct FakeState {
     speed: f64,
     duration_ms: Option<u64>,
     pub volume: f64,
+    pub normalize: bool,
 }
 
 impl FakeState {
@@ -161,6 +176,7 @@ impl FakePlayer {
             speed: 1.0,
             duration_ms: None,
             volume: 100.0,
+            normalize: false,
         }));
         // Background ticker: finishes simulated loads and detects EOF.
         let st = state.clone();

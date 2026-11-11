@@ -27,6 +27,8 @@ pub struct EngineConfig {
     pub fake_rate: f64,
     pub tools: Tools,
     pub volume: f64,
+    /// Loudness normalization (same perceived volume for every song).
+    pub normalize: bool,
     /// Run `yt-dlp -U` in the background on start.
     pub auto_update: bool,
 }
@@ -52,6 +54,7 @@ pub enum Command {
     Move(Uuid, usize),
     Add(String),
     SetVolume(f64),
+    SetNormalize(bool),
     SetTools(Tools),
     Shutdown,
 }
@@ -513,6 +516,12 @@ impl Engine {
                     p.set_volume(self.view.volume).await;
                 }
             }
+            Command::SetNormalize(on) => {
+                self.cfg.normalize = on;
+                if let Some(p) = &self.player {
+                    p.set_normalize(on).await;
+                }
+            }
             Command::SetTools(tools) => {
                 let had_ytdlp = self.cfg.tools.yt_dlp.is_some();
                 self.resolver.set_path(tools.yt_dlp.clone());
@@ -773,7 +782,14 @@ impl Engine {
             self.view.player_error = Some(strings::MPV_MISSING.into());
             return;
         };
-        match crate::mpv::Mpv::spawn(&mpv, self.view.volume, self.player_tx.clone()).await {
+        match crate::mpv::Mpv::spawn(
+            &mpv,
+            self.view.volume,
+            self.cfg.normalize,
+            self.player_tx.clone(),
+        )
+        .await
+        {
             Ok(m) => {
                 self.view.player_error = None;
                 self.player = Some(Player::Mpv(Box::new(m)));

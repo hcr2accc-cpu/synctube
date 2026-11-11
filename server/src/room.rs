@@ -50,6 +50,9 @@ struct Barrier {
     version: u64,
     deadline: Instant,
     ready: HashSet<Uuid>,
+    /// Members present when loading began. Someone who joins later does not
+    /// hold the others back; they catch up on their own once playback runs.
+    waiting_for: HashSet<Uuid>,
 }
 
 struct Room {
@@ -270,6 +273,7 @@ impl Room {
             version,
             deadline: Instant::now() + timeout,
             ready: HashSet::new(),
+            waiting_for: self.members.iter().map(|m| m.id).collect(),
         });
         self.touch();
     }
@@ -328,7 +332,12 @@ impl Room {
     fn check_barrier(&mut self) {
         let done = match &self.barrier {
             Some(b) => {
-                !self.members.is_empty() && self.members.iter().all(|m| b.ready.contains(&m.id))
+                !self.members.is_empty()
+                    && self
+                        .members
+                        .iter()
+                        .filter(|m| b.waiting_for.contains(&m.id))
+                        .all(|m| b.ready.contains(&m.id))
             }
             None => false,
         };
@@ -430,6 +439,7 @@ impl Room {
         }
         if let Some(b) = &mut self.barrier {
             b.ready.remove(&conn);
+            b.waiting_for.remove(&conn);
         }
         self.broadcast(&ServerMsg::Members {
             list: self.members_list(),

@@ -81,6 +81,7 @@ impl App {
                 fake_rate: 1.0,
                 tools,
                 volume: config.volume,
+                normalize: config.normalize,
                 auto_update: true,
             },
             notify.clone(),
@@ -223,6 +224,8 @@ impl App {
                 _ if view.joined => {
                     self.connecting = false;
                     self.connect_error = None;
+                    self.config.remember_current();
+                    self.config.save();
                     self.screen = Screen::Room;
                     return;
                 }
@@ -235,6 +238,7 @@ impl App {
         }
         let mut submit = false;
         let mut cancel = false;
+        let mut recent_action = None;
         background_panel().show(ui, |ui| {
             footer(ui, view);
             centered_card(ui, "connect_card", 420.0, |ui| {
@@ -307,11 +311,29 @@ impl App {
                     ui.add_space(8.0);
                     error_box(ui, e);
                 }
+                if !self.connecting && !self.config.recent.is_empty() {
+                    recent_action = recent_rooms_ui(ui, &self.config.recent);
+                }
             });
         });
         if cancel {
             self.send(Command::Leave);
             self.connecting = false;
+        } else if let Some(action) = recent_action {
+            match action {
+                RecentAction::Join(i) => {
+                    if let Some(r) = self.config.recent.get(i).cloned() {
+                        self.config.use_recent(&r);
+                        self.try_connect();
+                    }
+                }
+                RecentAction::Forget(i) => {
+                    if i < self.config.recent.len() {
+                        self.config.recent.remove(i);
+                        self.config.save();
+                    }
+                }
+            }
         } else if submit && !self.connecting {
             self.try_connect();
         }
@@ -757,6 +779,20 @@ impl App {
                         self.set_volume(0.0);
                     }
                 }
+                ui.add_space(6.0);
+                let on = self.config.normalize;
+                if toggle_pill(ui, s::NORMALIZE, on)
+                    .on_hover_text(if on {
+                        s::NORMALIZE_ON
+                    } else {
+                        s::NORMALIZE_OFF
+                    })
+                    .clicked()
+                {
+                    self.config.normalize = !on;
+                    self.config.save();
+                    self.send(Command::SetNormalize(!on));
+                }
             });
         });
     }
@@ -1060,6 +1096,109 @@ impl App {
     }
 }
 
+// ----- recent rooms ------------------------------------------------------------------
+
+enum RecentAction {
+    Join(usize),
+    Forget(usize),
+}
+
+const RECENT_ROW_H: f32 = 48.0;
+/// Rows shown before the list scrolls.
+const RECENT_VISIBLE: f32 = 4.5;
+
+/// The "recent rooms" list under the connect button.
+fn recent_rooms_ui(
+    ui: &mut egui::Ui,
+    recent: &[crate::config::RecentRoom],
+) -> Option<RecentAction> {
+    let mut action = None;
+    ui.add_space(18.0);
+    let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(line, 0.0, theme::BORDER);
+    ui.add_space(12.0);
+    section_label(ui, s::RECENT_ROOMS);
+    ui.add_space(4.0);
+    egui::ScrollArea::vertical()
+        .id_salt("recent_rooms")
+        // Shrink to the space left in short windows (at least one row).
+        .max_height(
+            (RECENT_ROW_H * RECENT_VISIBLE).min(ui.available_height().max(RECENT_ROW_H + 4.0)),
+        )
+        .auto_shrink([false, true])
+        // Show the bar whenever rows are hidden (small windows), not only on hover.
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for (i, r) in recent.iter().enumerate() {
+                if let Some(a) = recent_row(ui, i, r) {
+                    action = Some(a);
+                }
+            }
+        });
+    action
+}
+
+fn recent_row(ui: &mut egui::Ui, i: usize, r: &crate::config::RecentRoom) -> Option<RecentAction> {
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(ui.available_width(), RECENT_ROW_H), Sense::click());
+    let hovered = ui.rect_contains_pointer(rect);
+    let p = ui.painter().clone();
+    if hovered {
+        p.rect_filled(rect, 8.0, theme::CARD_HOVER);
+    }
+    let c = theme::name_color(&r.room);
+    let avatar = pos2(rect.left() + 22.0, rect.center().y);
+    p.circle_filled(avatar, 15.0, c.gamma_multiply(0.22));
+    let initial: String = r
+        .room
+        .chars()
+        .next()
+        .map(|ch| ch.to_uppercase().collect())
+        .unwrap_or_default();
+    p.text(avatar, Align2::CENTER_CENTER, initial, bold_font(13.0), c);
+
+    let text_left = rect.left() + 46.0;
+    let max_w = (rect.right() - 40.0 - text_left).max(40.0);
+    let title = one_line(ui, &r.room, bold_font(14.0), theme::TEXT, max_w);
+    p.galley(
+        pos2(text_left, rect.center().y - title.size().y - 1.0),
+        title,
+        theme::TEXT,
+    );
+    let sub = format!("{} · {}", r.name, r.server_host());
+    let sub = one_line(ui, &sub, font(12.0), theme::TEXT_DIM, max_w);
+    p.galley(pos2(text_left, rect.center().y + 2.0), sub, theme::TEXT_DIM);
+
+    let mut forget = false;
+    if hovered {
+        let arect = Rect::from_min_max(
+            pos2(rect.right() - 36.0, rect.top()),
+            pos2(rect.right() - 6.0, rect.bottom()),
+        );
+        let mut ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt(("recent_forget", i))
+                .max_rect(arect)
+                .layout(Layout::right_to_left(Align::Center)),
+        );
+        forget = icons::ghost(&mut ui, Icon::Remove, 26.0, true)
+            .on_hover_text(s::RECENT_FORGET)
+            .clicked();
+    }
+    if forget {
+        Some(RecentAction::Forget(i))
+    } else if resp
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(s::RECENT_JOIN)
+        .clicked()
+    {
+        Some(RecentAction::Join(i))
+    } else {
+        None
+    }
+}
+
 // ----- shared widgets ----------------------------------------------------------------
 
 fn background_panel() -> egui::CentralPanel {
@@ -1226,6 +1365,50 @@ fn tag(
         text_color,
     );
     resp
+}
+
+/// A clickable on/off pill (accent when on).
+fn toggle_pill(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    let color = if on {
+        theme::ACCENT_HOVER
+    } else {
+        theme::TEXT_DIM
+    };
+    let g = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font(12.5), color);
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 32.0, 26.0), Sense::click());
+    let hovered = resp.hovered();
+    let (fill, stroke) = if on {
+        (
+            theme::accent_alpha(if hovered { 46 } else { 30 }),
+            theme::ACCENT,
+        )
+    } else if hovered {
+        (theme::CARD_HOVER, theme::BORDER)
+    } else {
+        (Color32::TRANSPARENT, theme::BORDER)
+    };
+    let p = ui.painter();
+    p.rect(
+        rect,
+        13.0,
+        fill,
+        Stroke::new(1.0, stroke),
+        StrokeKind::Inside,
+    );
+    let dot = pos2(rect.left() + 13.0, rect.center().y);
+    if on {
+        p.circle_filled(dot, 3.5, theme::ACCENT);
+    } else {
+        p.circle_stroke(dot, 3.0, Stroke::new(1.2, theme::TEXT_FAINT));
+    }
+    p.galley(
+        pos2(rect.left() + 22.0, rect.center().y - g.size().y / 2.0),
+        g,
+        color,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn error_box(ui: &mut egui::Ui, text: &str) {
@@ -1639,6 +1822,12 @@ mod tests {
         let all: String = [
             s::APP_TITLE,
             s::CONNECT_HEADING,
+            s::RECENT_ROOMS,
+            s::NORMALIZE,
+            s::NORMALIZE_ON,
+            s::NORMALIZE_OFF,
+            s::RECENT_JOIN,
+            s::RECENT_FORGET,
             s::WAKING_SERVER,
             s::RECONNECTING,
             s::SERVER_UNREACHABLE,

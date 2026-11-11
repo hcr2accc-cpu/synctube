@@ -11,6 +11,14 @@ pub const NICKNAME: &str = "Nadimak";
 pub const CONNECT: &str = "Poveži se";
 pub const CANCEL: &str = "Otkaži";
 pub const FILL_ALL: &str = "Popuni adresu servera, sobu i nadimak.";
+pub const NORMALIZE: &str = "Ujednači jačinu";
+pub const NORMALIZE_ON: &str =
+    "Uključeno: sve pesme sviraju približno jednako glasno. Klikni da isključiš.";
+pub const NORMALIZE_OFF: &str =
+    "Isključeno: pesme sviraju originalnom jačinom. Klikni da uključiš.";
+pub const RECENT_ROOMS: &str = "Nedavne sobe";
+pub const RECENT_JOIN: &str = "Klikni da uđeš ponovo";
+pub const RECENT_FORGET: &str = "Ukloni sa liste";
 pub const BAD_SERVER_URL: &str = "Adresa servera mora početi sa ws:// ili wss://";
 
 // Connection status
