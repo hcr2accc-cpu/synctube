@@ -1,0 +1,64 @@
+# Builds the Linux desktop client and publishes it as the "linux" release:
+# https://github.com/<owner>/<repo>/releases/download/linux/synctube-linux-x86_64.tar.gz
+name: Linux client
+
+on:
+  push:
+    branches: [main]
+    paths: ["client/**", "shared/**", "Cargo.*", ".github/workflows/linux.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Older Ubuntu = older glibc, so the binary runs on more distributions.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # winit/glutin load these at runtime, so a failed install is not fatal.
+      - name: System libraries
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -o Acquire::Retries=3 &&
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
+              libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+              libxrandr-dev libxi-dev libgl1-mesa-dev && break
+            sleep 20
+          done
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: cargo clippy -p client -p shared --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test -p client -p shared
+
+      - name: Build
+        run: cargo build --release -p client --bin synctube
+
+      - name: Package
+        run: |
+          mkdir -p pkg/synctube
+          cp target/release/synctube pkg/synctube/
+          strip pkg/synctube/synctube
+          cp LINUX.md pkg/synctube/README.md
+          tar -C pkg -czf synctube-linux-x86_64.tar.gz synctube
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view linux >/dev/null 2>&1 || \
+            gh release create linux --title "SyncTube za Linux" \
+              --notes "Linux verzija SyncTube klijenta. Uputstvo je u README.md unutar arhive."
+          gh release upload linux synctube-linux-x86_64.tar.gz --clobber

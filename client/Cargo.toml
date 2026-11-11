@@ -1,0 +1,50 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "synctube"
+
+[lib]
+name = "client"
+path = "src/lib.rs"
+
+# GUI app (no console window).
+[[bin]]
+name = "synctube"
+path = "src/main.rs"
+
+# Console front-end for testing the sync core without the GUI.
+[[bin]]
+name = "synctube-cli"
+path = "src/bin/synctube-cli.rs"
+
+[dependencies]
+shared.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net", "process", "io-util"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+sevenz-rust2 = { version = "0.25", default-features = false }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# Linux needs a windowing backend for winit (X11 and Wayland).
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard", "x11", "wayland"] }

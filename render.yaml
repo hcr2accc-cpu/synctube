@@ -1,0 +1,14 @@
+# Render Blueprint: one free Docker web service running the SyncTube server.
+services:
+  - type: web
+    name: synctube-server
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: RUST_LOG
+        value: info

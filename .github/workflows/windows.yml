@@ -1,0 +1,35 @@
+# Builds the Windows client and publishes it as the "windows" release:
+# https://github.com/<owner>/<repo>/releases/download/windows/synctube.exe
+name: Windows client
+
+on:
+  push:
+    branches: [main]
+    paths: ["client/**", "shared/**", "Cargo.*", ".github/workflows/windows.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked -p client --bin synctube
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view windows >/dev/null 2>&1 || \
+            gh release create windows --title "SyncTube za Windows" \
+              --notes "Windows verzija SyncTube klijenta. Preuzmi synctube.exe i pokreni ga."
+          gh release upload windows target/release/synctube.exe --clobber
