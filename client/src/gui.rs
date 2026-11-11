@@ -1,11 +1,12 @@
 //! egui front-end: dependency download, connect screen and room screen.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, pos2, vec2, Align, Align2, Color32, CornerRadius, Event, FontId, Frame, Key, Layout,
-    Margin, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder,
+    self, pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Event, FontId, Frame, Id,
+    Key, LayerId, Layout, Margin, Order, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder,
 };
 use shared::{PlayStatus, RoomState};
 use uuid::Uuid;
@@ -20,6 +21,7 @@ use crate::paths::Tools;
 use crate::strings as s;
 use crate::theme::{self, bold_font, font};
 use crate::thumbs::Thumbs;
+use crate::ytdlp::SearchHit;
 
 const TOAST_SECS: f32 = 5.0;
 const TOAST_FADE: f32 = 0.35;
@@ -41,6 +43,15 @@ enum Scroll {
     End,
 }
 
+/// A queue row being dragged to a new place.
+struct QueueDrag {
+    id: Uuid,
+    /// Pointer offset from the row's top, so the floating row doesn't jump.
+    grab_dy: f32,
+    /// Insertion slot (0..=len) under the pointer.
+    slot: usize,
+}
+
 pub struct App {
     engine: Option<EngineHandle>,
     config: Config,
@@ -56,6 +67,11 @@ pub struct App {
     thumbs: Thumbs,
     last_current: Option<Uuid>,
     scroll: Option<Scroll>,
+    drag: Option<QueueDrag>,
+    /// The YouTube search results replace the queue while open.
+    search_open: bool,
+    /// Videos added from the current search (shown with a check).
+    search_added: HashSet<String>,
     seek_drag: Option<f32>,
     seek_hold: Option<(u64, Instant)>,
     bar_width: f32,
@@ -96,6 +112,9 @@ impl App {
             link: String::new(),
             focus_link: false,
             filter: String::new(),
+            drag: None,
+            search_open: false,
+            search_added: HashSet::new(),
             muted_from: None,
             thumbs,
             last_current: None,
@@ -318,6 +337,7 @@ impl App {
         });
         if cancel {
             self.send(Command::Leave);
+            self.search_open = false;
             self.connecting = false;
         } else if let Some(action) = recent_action {
             match action {
@@ -430,6 +450,7 @@ impl App {
                             .clicked()
                         {
                             self.send(Command::Leave);
+                            self.search_open = false;
                             self.screen = Screen::Connect;
                         }
                         connection_pill(ui, view);
@@ -461,7 +482,11 @@ impl App {
             .show(ui, |ui| {
                 self.now_playing_ui(ui, view, &room);
                 ui.add_space(14.0);
-                self.queue_ui(ui, view, &room);
+                if self.search_open {
+                    self.search_ui(ui, view, &room);
+                } else {
+                    self.queue_ui(ui, view, &room);
+                }
             });
     }
 
@@ -512,10 +537,14 @@ impl App {
                 r.request_focus();
             }
             let can_add = !self.link.trim().is_empty();
+            let (icon, label) = if is_search(&self.link) {
+                (Icon::Search, s::SEARCH)
+            } else {
+                (Icon::Plus, s::ADD)
+            };
             let enter = enter_pressed(ui, &r);
             let h = r.rect.height().max(36.0);
-            let clicked =
-                primary_button(ui, Some(Icon::Plus), s::ADD, vec2(btn_w, h), can_add).clicked();
+            let clicked = primary_button(ui, Some(icon), label, vec2(btn_w, h), can_add).clicked();
             if can_add && (clicked || enter) {
                 submit = true;
                 // Keep the field focused so several links can be added in a row.
@@ -529,9 +558,161 @@ impl App {
                 .color(theme::TEXT_FAINT),
         );
         if submit {
-            let link = std::mem::take(&mut self.link);
-            self.send(Command::Add(link.trim().to_string()));
-            self.scroll = Some(Scroll::End);
+            let text = self.link.trim().to_string();
+            if is_search(&text) {
+                // The query stays in the field, so it can be refined.
+                self.send(Command::Search(text));
+                self.search_open = true;
+                self.search_added.clear();
+            } else {
+                self.link.clear();
+                self.send(Command::Add(text));
+                self.search_open = false;
+                self.scroll = Some(Scroll::End);
+            }
+        }
+    }
+
+    /// YouTube search results, each with a button that adds it to the queue.
+    fn search_ui(&mut self, ui: &mut egui::Ui, view: &View, room: &RoomState) {
+        let search = &view.search;
+        let mut close = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(s::SEARCH_TITLE)
+                    .font(bold_font(15.5))
+                    .color(theme::TEXT),
+            );
+            if !search.query.is_empty() {
+                ui.label(
+                    RichText::new(format!("· {}", search.query))
+                        .size(13.0)
+                        .color(theme::TEXT_DIM),
+                );
+            }
+            if !search.results.is_empty() {
+                ui.label(
+                    RichText::new(format!("· {}", s::SEARCH_HINT))
+                        .size(12.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new(s::BACK_TO_QUEUE).min_size(vec2(0.0, 28.0)))
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+        let escape =
+            !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(Key::Escape));
+        if close || escape {
+            self.search_open = false;
+            self.send(Command::ClearSearch);
+            return;
+        }
+        if let Some(e) = &search.error {
+            empty_state(ui, e, "");
+            return;
+        }
+        if search.loading || search.results.is_empty() {
+            ui.add_space(48.0);
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Spinner::new().size(26.0).color(theme::ACCENT));
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(s::SEARCHING)
+                        .size(13.0)
+                        .color(theme::TEXT_DIM),
+                );
+            });
+            return;
+        }
+
+        let in_queue: HashSet<&str> = room.queue.iter().map(|t| t.youtube_id.as_str()).collect();
+        let hits = &search.results;
+        ui.spacing_mut().item_spacing.y = ROW_GAP;
+        egui::ScrollArea::vertical()
+            // A new search starts scrolled to the top.
+            .id_salt(("search_scroll", &search.query))
+            .auto_shrink([false, false])
+            .show_rows(ui, ROW_H, hits.len(), |ui, range| {
+                for hit in &hits[range] {
+                    let added = in_queue.contains(hit.youtube_id.as_str())
+                        || self.search_added.contains(&hit.youtube_id);
+                    self.search_row(ui, hit, added);
+                }
+            });
+    }
+
+    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit, added: bool) {
+        let (rect, resp) =
+            ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+        let p = ui.painter().clone();
+        if ui.rect_contains_pointer(rect) {
+            p.rect_filled(rect, 8.0, theme::CARD_HOVER);
+        }
+        let thumb = Rect::from_min_size(
+            pos2(rect.left() + 8.0, rect.center().y - 18.0),
+            vec2(64.0, 36.0),
+        );
+        let tex = self.thumbs.get(&hit.youtube_id);
+        paint_thumb(ui, thumb, tex, 5);
+
+        let btn =
+            Rect::from_center_size(pos2(rect.right() - 24.0, rect.center().y), vec2(30.0, 30.0));
+        let btn_resp = ui.interact(
+            btn,
+            ui.scope_id().with(("search_add", &hit.youtube_id)),
+            Sense::click(),
+        );
+        let add = if added {
+            p.circle_filled(btn.center(), 15.0, theme::accent_alpha(36));
+            icons::paint(&p, Icon::Check, btn.shrink(9.0), theme::ACCENT);
+            btn_resp.on_hover_text(s::IN_QUEUE);
+            false
+        } else {
+            let fill = if btn_resp.hovered() {
+                theme::ACCENT_HOVER
+            } else {
+                theme::ACCENT
+            };
+            p.circle_filled(btn.center(), 15.0, fill);
+            icons::paint(&p, Icon::Plus, btn.shrink(9.5), Color32::WHITE);
+            let btn_resp = btn_resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(s::ADD_TO_QUEUE);
+            btn_resp.clicked() || resp.double_clicked()
+        };
+
+        let dur_right = btn.left() - 14.0;
+        let text_left = thumb.right() + 12.0;
+        let max_w = (dur_right - 56.0 - text_left).max(40.0);
+        let title = one_line(ui, &hit.title, font(14.0), theme::TEXT, max_w);
+        p.galley(
+            pos2(text_left, rect.center().y - title.size().y - 1.0),
+            title,
+            theme::TEXT,
+        );
+        if let Some(ch) = &hit.channel {
+            let ch = one_line(ui, ch, font(12.0), theme::TEXT_DIM, max_w);
+            p.galley(pos2(text_left, rect.center().y + 2.0), ch, theme::TEXT_DIM);
+        }
+        if let Some(d) = hit.duration_ms {
+            p.text(
+                pos2(dur_right, rect.center().y),
+                Align2::RIGHT_CENTER,
+                fmt_time(d),
+                font(12.5),
+                theme::TEXT_FAINT,
+            );
+        }
+        if add {
+            self.send(Command::Add(shared::youtube::watch_url(&hit.youtube_id)));
+            self.search_added.insert(hit.youtube_id.clone());
         }
     }
 
@@ -866,7 +1047,13 @@ impl App {
                 (s::NO_MATCHES, "")
             };
             empty_state(ui, title, hint);
+            self.drag = None;
             return;
+        }
+        // Reordering works on the full list only (not on search results).
+        let can_drag = q.is_empty();
+        if !can_drag || ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.drag = None;
         }
 
         ui.spacing_mut().item_spacing.y = ROW_GAP;
@@ -891,14 +1078,123 @@ impl App {
         }
         let playing = room.playback.status == PlayStatus::Playing;
         area.show_rows(ui, ROW_H, n, |ui, range| {
+            let content_top = ui.cursor().top() - range.start as f32 * step;
             for r in range {
                 if let Some(&i) = rows.get(r) {
-                    self.queue_row(ui, room, i, current, playing);
+                    self.queue_row(ui, room, i, current, playing, can_drag);
                 } else if let Some(p) = pending.get(r - rows.len()) {
                     pending_row(ui, p);
                 }
             }
+            self.drag_feedback(ui, room, content_top, step);
         });
+        self.finish_drag(ui, room);
+    }
+
+    /// While dragging: tracks the drop slot, scrolls near the edges, and
+    /// draws the drop line and the floating row.
+    fn drag_feedback(&mut self, ui: &mut egui::Ui, room: &RoomState, content_top: f32, step: f32) {
+        let Some(d) = &mut self.drag else { return };
+        let Some(ptr) = ui.ctx().pointer_latest_pos() else {
+            return;
+        };
+        let len = room.queue.len();
+        let Some(from) = room.queue.iter().position(|t| t.id == d.id) else {
+            self.drag = None;
+            return;
+        };
+        d.slot = ((ptr.y - content_top) / step + 0.5)
+            .floor()
+            .clamp(0.0, len as f32) as usize;
+        let clip = ui.clip_rect();
+        let edge = 40.0;
+        let dy = if ptr.y < clip.top() + edge {
+            (clip.top() + edge - ptr.y).min(edge) * 0.35
+        } else if ptr.y > clip.bottom() - edge {
+            -(ptr.y - (clip.bottom() - edge)).min(edge) * 0.35
+        } else {
+            0.0
+        };
+        if dy != 0.0 {
+            ui.scroll_with_delta(vec2(0.0, dy));
+        }
+        ui.ctx().request_repaint();
+
+        let left = ui.max_rect().left();
+        let right = ui.max_rect().right();
+        if d.slot != from && d.slot != from + 1 {
+            let y = (content_top + d.slot as f32 * step - ROW_GAP / 2.0)
+                .clamp(clip.top() + 1.0, clip.bottom() - 1.0);
+            let p = ui.painter();
+            p.line_segment(
+                [pos2(left + 8.0, y), pos2(right - 4.0, y)],
+                Stroke::new(2.0, theme::ACCENT),
+            );
+            p.circle_filled(pos2(left + 8.0, y), 4.0, theme::ACCENT);
+        }
+
+        // The row follows the pointer above everything else.
+        let t = &room.queue[from];
+        let top = ptr.y - d.grab_dy;
+        let rect = Rect::from_min_size(pos2(left, top), vec2(right - left, ROW_H));
+        let p = ui
+            .ctx()
+            .layer_painter(LayerId::new(Order::Tooltip, Id::unique("queue_drag")));
+        p.rect(
+            rect,
+            8.0,
+            theme::CARD_HOVER,
+            Stroke::new(1.0, theme::ACCENT),
+            StrokeKind::Inside,
+        );
+        let thumb =
+            Rect::from_min_size(pos2(left + 40.0, rect.center().y - 18.0), vec2(64.0, 36.0));
+        match self.thumbs.get(&t.youtube_id) {
+            Some(tex) => {
+                p.image(
+                    tex,
+                    thumb,
+                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            None => {
+                p.rect_filled(thumb, 5.0, theme::CARD);
+            }
+        }
+        let text_left = thumb.right() + 12.0;
+        let title = one_line(
+            ui,
+            &t.title,
+            font(14.0),
+            theme::TEXT,
+            (right - text_left - 16.0).max(40.0),
+        );
+        p.galley(
+            pos2(text_left, rect.center().y - title.size().y / 2.0),
+            title,
+            theme::TEXT,
+        );
+    }
+
+    /// On release: moves the dragged track to the slot under the pointer.
+    fn finish_drag(&mut self, ui: &egui::Ui, room: &RoomState) {
+        if self.drag.is_none() {
+            return;
+        }
+        if ui.input(|i| i.pointer.primary_down()) {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            return;
+        }
+        let Some(d) = self.drag.take() else { return };
+        let Some(from) = room.queue.iter().position(|t| t.id == d.id) else {
+            return;
+        };
+        let to = if d.slot > from { d.slot - 1 } else { d.slot };
+        let to = to.min(room.queue.len().saturating_sub(1));
+        if to != from {
+            self.send(Command::Move(d.id, to));
+        }
     }
 
     fn queue_row(
@@ -908,13 +1204,20 @@ impl App {
         i: usize,
         current: Option<usize>,
         playing: bool,
+        can_drag: bool,
     ) {
         let t = &room.queue[i];
         let len = room.queue.len();
         let is_cur = current == Some(i);
-        let (rect, resp) =
-            ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-        let hovered = ui.rect_contains_pointer(rect);
+        let sense = if can_drag {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), sense);
+        let dragging = self.drag.is_some();
+        let is_dragged = self.drag.as_ref().is_some_and(|d| d.id == t.id);
+        let hovered = ui.rect_contains_pointer(rect) && !dragging;
         let p = ui.painter().clone();
         if is_cur {
             p.rect_filled(rect, 8.0, theme::accent_alpha(30));
@@ -942,6 +1245,49 @@ impl App {
             Rect::from_min_size(pos2(num.right(), rect.center().y - 18.0), vec2(64.0, 36.0));
         let tex = self.thumbs.get(&t.youtube_id);
         paint_thumb(ui, thumb, tex, 5);
+        // The thumbnail is a play button (play/pause for the current song).
+        let thumb_resp = ui.interact(thumb, ui.scope_id().with(("thumb", t.id)), sense);
+        if thumb_resp.hovered() && !dragging {
+            p.rect_filled(thumb, 5.0, Color32::from_black_alpha(140));
+            let icon = if is_cur && playing {
+                Icon::Pause
+            } else {
+                Icon::Play
+            };
+            icons::paint(
+                &p,
+                icon,
+                Rect::from_center_size(thumb.center(), vec2(16.0, 16.0)),
+                Color32::WHITE,
+            );
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        let thumb_resp = if is_cur {
+            thumb_resp
+        } else {
+            thumb_resp.on_hover_text(s::PLAY_THIS)
+        };
+        if thumb_resp.clicked() {
+            if !is_cur {
+                self.send(Command::PlayTrack(t.id));
+            } else if playing {
+                self.send(Command::Pause);
+            } else {
+                self.send(Command::Play);
+            }
+        }
+        if can_drag && (resp.drag_started() || thumb_resp.drag_started()) {
+            if let Some(ptr) = ui.ctx().pointer_interact_pos() {
+                self.drag = Some(QueueDrag {
+                    id: t.id,
+                    grab_dy: ptr.y - rect.top(),
+                    slot: i,
+                });
+            }
+        }
+        if can_drag && resp.hovered() && !dragging {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
 
         let actions_w = if hovered { 4.0 * 28.0 + 6.0 } else { 0.0 };
         let dur_right = rect.right() - actions_w - 12.0;
@@ -1018,6 +1364,10 @@ impl App {
         }
         if resp.double_clicked() && !is_cur {
             self.send(Command::PlayTrack(t.id));
+        }
+        if is_dragged {
+            // The row floats under the pointer; leave a faded gap here.
+            p.rect_filled(rect, 8.0, theme::BG.gamma_multiply(0.75));
         }
     }
 
@@ -1282,6 +1632,16 @@ fn field(
 
 fn enter_pressed(ui: &egui::Ui, r: &egui::Response) -> bool {
     r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))
+}
+
+/// Text in the add field that is not a link is a YouTube search.
+fn is_search(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty()
+        && shared::youtube::parse_youtube_url(t).is_none()
+        && !t.starts_with("http://")
+        && !t.starts_with("https://")
+        && !t.starts_with("www.")
 }
 
 /// The filled accent button.
@@ -1823,6 +2183,16 @@ mod tests {
             s::APP_TITLE,
             s::CONNECT_HEADING,
             s::RECENT_ROOMS,
+            s::PLAY_THIS,
+            s::SEARCH,
+            s::SEARCH_TITLE,
+            s::BACK_TO_QUEUE,
+            s::ADD_TO_QUEUE,
+            s::IN_QUEUE,
+            s::SEARCHING,
+            s::SEARCH_NOTHING,
+            s::SEARCH_FAILED,
+            s::SEARCH_HINT,
             s::NORMALIZE,
             s::NORMALIZE_ON,
             s::NORMALIZE_OFF,
@@ -1847,6 +2217,15 @@ mod tests {
             s::SERVER_URL_HINT,
             s::MOVE_UP,
             s::PLAY_THIS,
+            s::SEARCH,
+            s::SEARCH_TITLE,
+            s::BACK_TO_QUEUE,
+            s::ADD_TO_QUEUE,
+            s::IN_QUEUE,
+            s::SEARCHING,
+            s::SEARCH_NOTHING,
+            s::SEARCH_FAILED,
+            s::SEARCH_HINT,
             s::ADDED_BY,
             s::SEARCH_QUEUE,
             s::LOADING_PLAYLIST,

@@ -3,6 +3,7 @@
 //! thread with a single-threaded tokio runtime; the UI talks to it through
 //! a command channel and reads a shared `View` snapshot.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use crate::net::{self, NetEvent, NetHandle};
 use crate::paths::Tools;
 use crate::player::{FakePlayer, Player, PlayerEvent};
 use crate::strings;
-use crate::ytdlp::{Resolver, StreamInfo};
+use crate::ytdlp::{Resolver, SearchHit, StreamInfo};
 use shared::youtube::{parse_youtube_url, playlist_url, watch_url, YoutubeRef};
 
 /// Settings for the engine.
@@ -53,6 +54,9 @@ pub enum Command {
     Remove(Uuid),
     Move(Uuid, usize),
     Add(String),
+    /// Searches YouTube; results show up in [`View::search`].
+    Search(String),
+    ClearSearch,
     SetVolume(f64),
     SetNormalize(bool),
     SetTools(Tools),
@@ -98,6 +102,15 @@ pub struct PendingAdd {
     pub started: Instant,
 }
 
+/// The latest YouTube search.
+#[derive(Debug, Clone, Default)]
+pub struct SearchView {
+    pub query: String,
+    pub loading: bool,
+    pub results: Vec<SearchHit>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub text: String,
@@ -121,6 +134,7 @@ pub struct View {
     pub speed: f64,
     pub player_pos_ms: Option<u64>,
     pub pending_adds: Vec<PendingAdd>,
+    pub search: SearchView,
     pub toasts: Vec<Toast>,
     pub volume: f64,
     pub player_error: Option<String>,
@@ -215,6 +229,9 @@ enum CurPhase {
     Resolving,
     Loading,
     Seeking,
+    /// Loaded, but held (paused) until its loudness is known, so the song
+    /// does not start at the wrong level and jump a moment later.
+    AwaitGain,
     Active,
     Failed,
 }
@@ -229,6 +246,8 @@ struct Cur {
     paused: bool,
     speed: f64,
     reresolved: bool,
+    /// Loudness still being measured: wait for it at most until then.
+    gain_deadline: Option<Instant>,
 }
 
 enum TaskResult {
@@ -247,6 +266,14 @@ enum TaskResult {
         result: Result<StreamInfo, String>,
     },
     YtdlpVersion(Option<String>),
+    Search {
+        seq: u64,
+        result: Result<Vec<SearchHit>, String>,
+    },
+    Loudness {
+        youtube_id: String,
+        result: Result<crate::loudness::Loudness, String>,
+    },
 }
 
 const PING_BURST: u8 = 8;
@@ -261,6 +288,10 @@ const MAX_WAIT_MS: i64 = 6000;
 const MAX_TOASTS: usize = 20;
 /// Drop a pending add if the server has not answered the `Add` by then.
 const ADD_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longest a freshly loaded song waits for its loudness measurement.
+const GAIN_WAIT: Duration = Duration::from_millis(2500);
+/// How many upcoming songs are measured ahead, one at a time.
+const MEASURE_AHEAD: usize = 5;
 
 /// One submitted link, from `Add` until `AddResolved` is sent.
 struct AddJob {
@@ -304,12 +335,28 @@ struct Engine {
     load_comp_ms: u64,
     /// Estimated time for a seek inside a loaded stream (adaptive).
     seek_comp_ms: u64,
+    /// When the current track was picked (for timing logs).
+    track_t0: Option<Instant>,
     op_started: Option<Instant>,
     next_drift: Option<Instant>,
     next_ping: Option<Instant>,
     pings_left: u8,
     adds: Vec<AddJob>,
     next_add_id: u64,
+    /// Normalization gain (dB) per YouTube id, measured once per session.
+    gains: HashMap<String, f64>,
+    measuring: HashSet<String>,
+    /// Bumped per search, so a slow old search never replaces a newer one.
+    search_seq: u64,
+    /// Not retried (until the app restarts), so a bad stream is scanned once.
+    measure_failed: HashSet<String>,
+    /// Scanned again once with a fresh URL (a failed scan often means the
+    /// cached URL is bad, which would also stall the song's start).
+    measure_retried: HashSet<String>,
+    /// The upcoming song being measured in the background (one at a time).
+    measuring_ahead: Option<String>,
+    /// Measured loudness, kept on disk so a song is scanned only once.
+    loudness_store: crate::loudness::Store,
 }
 
 async fn sleep_opt(at: Option<Instant>) {
@@ -317,6 +364,17 @@ async fn sleep_opt(at: Option<Instant>) {
         Some(t) => tokio::time::sleep_until(t.into()).await,
         None => std::future::pending().await,
     }
+}
+
+/// Gain for a song not measured yet: the median of the measured ones, so
+/// the correction once it is known is small.
+fn typical_gain(gains: &HashMap<String, f64>) -> f64 {
+    if gains.len() < 3 {
+        return 0.0;
+    }
+    let mut g: Vec<f64> = gains.values().copied().collect();
+    g.sort_by(f64::total_cmp);
+    g[g.len() / 2]
 }
 
 fn ewma(old: u64, sample: u64) -> u64 {
@@ -358,20 +416,36 @@ impl Engine {
             align_attempts: 0,
             load_comp_ms: 1500,
             seek_comp_ms: 300,
+            track_t0: None,
             op_started: None,
             next_drift: None,
             next_ping: None,
             pings_left: 0,
             adds: Vec::new(),
             next_add_id: 0,
+            gains: HashMap::new(),
+            measuring: HashSet::new(),
+            search_seq: 0,
+            measure_failed: HashSet::new(),
+            measure_retried: HashSet::new(),
+            measuring_ahead: None,
+            loudness_store: crate::loudness::Store::default(),
         }
     }
 
     async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         self.start_ytdlp_maintenance();
+        if !self.cfg.fake_audio {
+            self.loudness_store =
+                crate::loudness::Store::load(crate::paths::app_dir().join("loudness.json"));
+            for (id, l) in self.loudness_store.iter() {
+                self.gains.insert(id.clone(), l.gain_db());
+            }
+        }
         loop {
             let spin_target = self.unpause_at;
             let wake_unpause = spin_target.map(|t| t - Duration::from_millis(SPIN_MS));
+            let gain_hold = self.gain_hold_deadline();
             tokio::select! {
                 c = cmd_rx.recv() => {
                     match c {
@@ -395,6 +469,7 @@ impl Engine {
                 }
                 _ = sleep_opt(self.next_drift) => self.drift_check().await,
                 _ = sleep_opt(self.next_ping) => self.ping_tick(),
+                _ = sleep_opt(gain_hold) => self.release_gain_hold().await,
             }
             self.publish();
         }
@@ -440,7 +515,7 @@ impl Engine {
         };
         match cur.phase {
             CurPhase::Resolving => Phase::Resolving,
-            CurPhase::Loading | CurPhase::Seeking => Phase::Buffering,
+            CurPhase::Loading | CurPhase::Seeking | CurPhase::AwaitGain => Phase::Buffering,
             CurPhase::Failed => Phase::Error(strings::RESOLVE_FAILED.into()),
             CurPhase::Active => match room.playback.status {
                 PlayStatus::Playing if self.unpause_at.is_some() || cur.paused => Phase::Waiting,
@@ -510,6 +585,29 @@ impl Engine {
                     self.send(ClientMsg::Add { url });
                 }
             },
+            Command::Search(query) => {
+                let query = query.trim().to_string();
+                if query.is_empty() {
+                    return;
+                }
+                self.search_seq += 1;
+                let seq = self.search_seq;
+                self.view.search = SearchView {
+                    query: query.clone(),
+                    loading: true,
+                    ..SearchView::default()
+                };
+                let resolver = self.resolver.clone();
+                let tx = self.task_tx.clone();
+                tokio::spawn(async move {
+                    let result = resolver.search(&query).await;
+                    let _ = tx.send(TaskResult::Search { seq, result });
+                });
+            }
+            Command::ClearSearch => {
+                self.search_seq += 1;
+                self.view.search = SearchView::default();
+            }
             Command::SetVolume(v) => {
                 self.view.volume = v.clamp(0.0, 100.0);
                 if let Some(p) = &self.player {
@@ -518,9 +616,11 @@ impl Engine {
             }
             Command::SetNormalize(on) => {
                 self.cfg.normalize = on;
-                if let Some(p) = &self.player {
-                    p.set_normalize(on).await;
+                let id = self.cur.as_ref().map(|c| c.youtube_id.clone());
+                if let Some(id) = &id {
+                    self.measure_loudness(id, None);
                 }
+                self.apply_gain().await;
             }
             Command::SetTools(tools) => {
                 let had_ytdlp = self.cfg.tools.yt_dlp.is_some();
@@ -761,7 +861,171 @@ impl Engine {
                 Err(e) => tracing::debug!(youtube_id, "duration lookup failed: {e}"),
             },
             TaskResult::Stream { track_id, result } => self.on_stream(track_id, result).await,
+            TaskResult::Search { seq, result } => {
+                if seq != self.search_seq {
+                    return;
+                }
+                let s = &mut self.view.search;
+                s.loading = false;
+                match result {
+                    Ok(hits) if hits.is_empty() => s.error = Some(strings::SEARCH_NOTHING.into()),
+                    Ok(hits) => s.results = hits,
+                    Err(e) => {
+                        tracing::warn!("search failed: {e}");
+                        s.error = Some(strings::SEARCH_FAILED.into());
+                    }
+                }
+            }
+            TaskResult::Loudness { youtube_id, result } => {
+                self.measuring.remove(&youtube_id);
+                if self.measuring_ahead.as_deref() == Some(youtube_id.as_str()) {
+                    self.measuring_ahead = None;
+                }
+                match result {
+                    Ok(l) => {
+                        let db = l.gain_db();
+                        tracing::info!(youtube_id, gain_db = db, "loudness measured");
+                        self.gains.insert(youtube_id.clone(), db);
+                        self.loudness_store.insert(&youtube_id, l);
+                    }
+                    Err(e) if self.measure_retried.insert(youtube_id.clone()) => {
+                        // Usually a bad cached URL: get a fresh one now, while
+                        // there is time, instead of when the song should start.
+                        tracing::warn!(youtube_id, "loudness scan failed, re-resolving: {e}");
+                        self.resolver.invalidate(&youtube_id);
+                        let current = self
+                            .cur
+                            .as_ref()
+                            .is_some_and(|c| c.youtube_id == youtube_id);
+                        if current {
+                            self.measure_loudness(&youtube_id, None);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(youtube_id, "loudness scan failed: {e}");
+                        self.measure_failed.insert(youtube_id.clone());
+                    }
+                }
+                self.measure_ahead();
+                if self
+                    .cur
+                    .as_ref()
+                    .is_some_and(|c| c.youtube_id == youtube_id)
+                {
+                    self.apply_gain().await;
+                    self.release_gain_hold().await;
+                }
+            }
         }
+    }
+
+    // ----- loudness ---------------------------------------------------------------
+
+    /// Starts measuring a song's loudness in the background (once per song).
+    /// Without `url` the stream is resolved first (cached by the resolver).
+    fn measure_loudness(&mut self, youtube_id: &str, url: Option<String>) {
+        if !self.cfg.normalize
+            || self.cfg.fake_audio
+            || self.gains.contains_key(youtube_id)
+            || self.measuring.contains(youtube_id)
+            || self.measure_failed.contains(youtube_id)
+        {
+            return;
+        }
+        let Some(mpv) = self.cfg.tools.mpv.clone() else {
+            return;
+        };
+        self.measuring.insert(youtube_id.to_string());
+        let resolver = self.resolver.clone();
+        let tx = self.task_tx.clone();
+        let youtube_id = youtube_id.to_string();
+        tokio::spawn(async move {
+            let url = match url {
+                Some(u) => Ok(u),
+                None => resolver
+                    .stream_info_background(&youtube_id)
+                    .await
+                    .map(|s| s.url),
+            };
+            let result = match url {
+                Ok(u) => crate::loudness::measure(&mpv, &u).await,
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(TaskResult::Loudness { youtube_id, result });
+        });
+    }
+
+    /// Sets the player's gain for the current song (0 when off or unknown).
+    /// Measures the next few songs (in queue order, one at a time), so they
+    /// start right away at the right level.
+    fn measure_ahead(&mut self) {
+        if !self.cfg.normalize || self.cfg.fake_audio || self.measuring_ahead.is_some() {
+            return;
+        }
+        // Not while a song is starting: it gets the bandwidth first.
+        if self
+            .cur
+            .as_ref()
+            .is_some_and(|c| c.phase != CurPhase::Active)
+        {
+            return;
+        }
+        let Some(room) = &self.room else { return };
+        let Some(i) = room.playback.track_index else {
+            return;
+        };
+        let next = room
+            .queue
+            .iter()
+            .skip(i + 1)
+            .take(MEASURE_AHEAD)
+            .map(|t| &t.youtube_id)
+            .find(|id| {
+                !self.gains.contains_key(*id)
+                    && !self.measuring.contains(*id)
+                    && !self.measure_failed.contains(*id)
+            })
+            .cloned();
+        if let Some(id) = next {
+            self.measure_loudness(&id, None);
+            if self.measuring.contains(&id) {
+                self.measuring_ahead = Some(id);
+            }
+        }
+    }
+
+    async fn apply_gain(&mut self) {
+        let gain = match &self.cur {
+            Some(c) if self.cfg.normalize => Some(
+                self.gains
+                    .get(&c.youtube_id)
+                    .copied()
+                    .unwrap_or_else(|| typical_gain(&self.gains)),
+            ),
+            _ => None,
+        };
+        if let Some(p) = &self.player {
+            p.set_gain(gain.unwrap_or(0.0)).await;
+        }
+    }
+
+    fn gain_hold_deadline(&self) -> Option<Instant> {
+        self.cur
+            .as_ref()
+            .filter(|c| c.phase == CurPhase::AwaitGain)
+            .and_then(|c| c.gain_deadline)
+    }
+
+    /// Lets a song that waited for its loudness continue (measured or not).
+    async fn release_gain_hold(&mut self) {
+        let Some(cur) = &mut self.cur else { return };
+        cur.gain_deadline = None;
+        if cur.phase != CurPhase::AwaitGain {
+            return;
+        }
+        cur.phase = CurPhase::Active;
+        self.continue_positioned().await;
+        self.measure_ahead();
     }
 
     // ----- player -----------------------------------------------------------------
@@ -782,14 +1046,7 @@ impl Engine {
             self.view.player_error = Some(strings::MPV_MISSING.into());
             return;
         };
-        match crate::mpv::Mpv::spawn(
-            &mpv,
-            self.view.volume,
-            self.cfg.normalize,
-            self.player_tx.clone(),
-        )
-        .await
-        {
+        match crate::mpv::Mpv::spawn(&mpv, self.view.volume, self.player_tx.clone()).await {
             Ok(m) => {
                 self.view.player_error = None;
                 self.player = Some(Player::Mpv(Box::new(m)));
@@ -951,7 +1208,7 @@ impl Engine {
                         let tx = self.task_tx.clone();
                         let youtube_id = t.youtube_id.clone();
                         tokio::spawn(async move {
-                            let result = resolver.stream_info(&youtube_id).await;
+                            let result = resolver.stream_info_background(&youtube_id).await;
                             let _ = tx.send(TaskResult::Duration { youtube_id, result });
                         });
                     }
@@ -976,6 +1233,9 @@ impl Engine {
         if cur.track_id != track_id || cur.phase != CurPhase::Resolving {
             return;
         }
+        let since = self.track_t0.map(|t| t.elapsed().as_millis() as u64);
+        tracing::info!(since_ms = since, "stream resolved");
+        let Some(cur) = &mut self.cur else { return };
         let url = match result {
             Ok(info) => {
                 if let (None, Some(d)) = (cur.duration_ms, info.duration_ms) {
@@ -1012,6 +1272,15 @@ impl Engine {
             Some(d) => start.min(d.saturating_sub(1000)),
             None => start,
         };
+        let youtube_id = self.cur.as_ref().map(|c| c.youtube_id.clone());
+        if let Some(id) = youtube_id {
+            self.measure_loudness(&id, Some(url.clone()));
+            let pending = self.measuring.contains(&id);
+            if let Some(c) = &mut self.cur {
+                c.gain_deadline = pending.then(|| Instant::now() + GAIN_WAIT);
+            }
+        }
+        self.apply_gain().await;
         let Some(player) = &self.player else { return };
         match player.load(&url, start, duration).await {
             Ok(entry) => {
@@ -1051,7 +1320,20 @@ impl Engine {
             }
             _ => return,
         }
+        let hold =
+            cur.phase == CurPhase::Loading && cur.gain_deadline.is_some_and(|t| Instant::now() < t);
+        if hold {
+            cur.phase = CurPhase::AwaitGain;
+            tracing::debug!("holding until loudness is known");
+            return;
+        }
         cur.phase = CurPhase::Active;
+        self.continue_positioned().await;
+        self.measure_ahead();
+    }
+
+    /// After a load or seek finished: report ready or join the timeline.
+    async fn continue_positioned(&mut self) {
         let version = self.room.as_ref().map(|r| r.playback.version);
         if self.applied_version != version {
             self.reconcile().await;
@@ -1070,6 +1352,8 @@ impl Engine {
         };
         if self.ready_sent != Some(v) {
             self.ready_sent = Some(v);
+            let since = self.track_t0.map(|t| t.elapsed().as_millis() as u64);
+            tracing::info!(since_ms = since, "ready sent");
             self.send(ClientMsg::Ready { version: v });
         }
     }
@@ -1090,12 +1374,24 @@ impl Engine {
             self.unload().await;
             return;
         }
+        // Measure upcoming songs ahead, so they start at the right level.
+        self.measure_ahead();
+        // The next song's URL is ready before it is needed (the queue can
+        // change at any time, so this is checked on every update).
+        if let Some(next) = room
+            .playback
+            .track_index
+            .and_then(|i| room.queue.get(i + 1))
+        {
+            self.resolver.prefetch(&next.youtube_id);
+        }
         let same = self.cur.as_ref().is_some_and(|c| c.track_id == track.id);
         if !same {
             self.unload().await;
             self.ended_sent = None;
             self.ready_sent = None;
             self.align_attempts = 0;
+            self.track_t0 = Some(Instant::now());
             self.cur = Some(Cur {
                 track_id: track.id,
                 youtube_id: track.youtube_id.clone(),
@@ -1105,15 +1401,9 @@ impl Engine {
                 paused: true,
                 speed: 1.0,
                 reresolved: false,
+                gain_deadline: None,
             });
             self.spawn_resolve(track.id, track.youtube_id.clone());
-            if let Some(next) = room
-                .playback
-                .track_index
-                .and_then(|i| room.queue.get(i + 1))
-            {
-                self.resolver.prefetch(&next.youtube_id);
-            }
             return;
         }
         let phase = self.cur.as_ref().map(|c| c.phase);

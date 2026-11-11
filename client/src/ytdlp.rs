@@ -1,7 +1,7 @@
 //! yt-dlp wrapper: stream URL resolution (cached, deduplicated, prefetchable)
 //! and metadata resolution for `Add`. Everything runs as async child processes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +18,9 @@ const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(45);
 const META_TIMEOUT: Duration = Duration::from_secs(120);
 const OEMBED_TIMEOUT: Duration = Duration::from_secs(5);
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(40);
+/// How many results a YouTube search returns.
+pub const SEARCH_RESULTS: usize = 20;
 /// Duration used for synthetic tracks in fake mode without yt-dlp.
 pub const FAKE_DURATION_MS: u64 = 30_000;
 
@@ -29,19 +32,35 @@ pub struct StreamInfo {
     pub duration_ms: Option<u64>,
 }
 
+/// One YouTube search result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub youtube_id: String,
+    pub title: String,
+    pub channel: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
 type Waiters = Vec<oneshot::Sender<Result<StreamInfo, String>>>;
 
 #[derive(Default)]
 struct Inner {
     cache: HashMap<String, (StreamInfo, Instant)>,
     inflight: HashMap<String, Waiters>,
+    /// Prefetches waiting for their turn.
+    queued: HashSet<String>,
 }
+
+/// yt-dlp runs at once for background work (prefetch, durations). Several
+/// parallel runs slow down the one a song is waiting for.
+const BACKGROUND_RESOLVES: usize = 1;
 
 #[derive(Clone)]
 pub struct Resolver {
     yt_dlp: Option<PathBuf>,
     fake: bool,
     inner: Arc<Mutex<Inner>>,
+    background: Arc<tokio::sync::Semaphore>,
 }
 
 impl Resolver {
@@ -50,6 +69,7 @@ impl Resolver {
             yt_dlp,
             fake,
             inner: Arc::default(),
+            background: Arc::new(tokio::sync::Semaphore::new(BACKGROUND_RESOLVES)),
         }
     }
 
@@ -67,14 +87,52 @@ impl Resolver {
     }
 
     /// Resolves in the background so the URL is cached when needed.
+    /// Cheap to call often: does nothing while the URL is cached or coming.
     pub fn prefetch(&self, youtube_id: &str) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let cached = inner
+                .cache
+                .get(youtube_id)
+                .is_some_and(|(_, at)| at.elapsed() < CACHE_TTL);
+            if cached
+                || inner.inflight.contains_key(youtube_id)
+                || !inner.queued.insert(youtube_id.to_string())
+            {
+                return;
+            }
+        }
         let me = self.clone();
         let id = youtube_id.to_string();
         tokio::spawn(async move {
-            if let Err(e) = me.stream_info(&id).await {
+            let result = me.stream_info_background(&id).await;
+            me.inner.lock().unwrap().queued.remove(&id);
+            if let Err(e) = result {
                 tracing::debug!(id, "prefetch failed: {e}");
             }
         });
+    }
+
+    /// Like [`Self::stream_info`], but queued behind other background work.
+    /// A song that has to play now joins (or overtakes) it instead of waiting.
+    /// The URL is also checked, since YouTube sometimes hands out one that
+    /// is refused: better to find out now than when the song should start.
+    pub async fn stream_info_background(&self, youtube_id: &str) -> Result<StreamInfo, String> {
+        let _permit = self.background.acquire().await;
+        let info = self.stream_info(youtube_id).await?;
+        if self.fake || !info.url.starts_with("https://") {
+            return Ok(info);
+        }
+        let url = info.url.clone();
+        let works = tokio::task::spawn_blocking(move || url_works(&url))
+            .await
+            .unwrap_or(true);
+        if works {
+            return Ok(info);
+        }
+        tracing::warn!(id = youtube_id, "stream URL is refused, resolving again");
+        self.invalidate(youtube_id);
+        self.stream_info(youtube_id).await
     }
 
     /// Direct audio stream URL for a video. Retries once on failure.
@@ -237,6 +295,30 @@ impl Resolver {
         Ok(tracks)
     }
 
+    /// Searches YouTube for videos (titles, channels and durations only).
+    pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>, String> {
+        if self.yt_dlp.is_none() && self.fake {
+            return Ok((0..5)
+                .map(|i| SearchHit {
+                    youtube_id: format!("fakesearch{i}"),
+                    title: format!("{query} {}", i + 1),
+                    channel: Some("Test".into()),
+                    duration_ms: Some(FAKE_DURATION_MS),
+                })
+                .collect());
+        }
+        let target = format!("ytsearch{SEARCH_RESULTS}:{query}");
+        let json = self
+            .run(
+                &["--flat-playlist", "-J", "--no-warnings", &target],
+                SEARCH_TIMEOUT,
+            )
+            .await?;
+        let v: Value =
+            serde_json::from_str(&json).map_err(|_| strings::SEARCH_FAILED.to_string())?;
+        Ok(parse_search(&v))
+    }
+
     /// `yt-dlp --version`.
     pub async fn version(&self) -> Option<String> {
         self.run(&["--version"], Duration::from_secs(30))
@@ -282,6 +364,17 @@ impl Resolver {
             })
         }
     }
+}
+
+/// Asks for the first two bytes. Only a clear refusal (4xx) counts as
+/// broken; a network hiccup does not.
+fn url_works(url: &str) -> bool {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(OEMBED_TIMEOUT))
+        .build()
+        .new_agent();
+    let r = agent.get(url).header("Range", "bytes=0-1").call();
+    !matches!(r, Err(ureq::Error::StatusCode(c)) if (400..500).contains(&c))
 }
 
 fn oembed_title(id: &str) -> Result<String, String> {
@@ -360,6 +453,43 @@ pub fn parse_metadata(v: &Value) -> Vec<TrackInfo> {
     }
 }
 
+/// Parses `yt-dlp --flat-playlist -J ytsearchN:...` output.
+pub fn parse_search(v: &Value) -> Vec<SearchHit> {
+    let Some(entries) = v.get("entries").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|e| {
+            let id = e.get("id")?.as_str()?;
+            if !shared::youtube::is_valid_video_id(id) {
+                return None;
+            }
+            // Live streams never end, so they cannot be queued.
+            let live = e.get("live_status").and_then(Value::as_str);
+            if matches!(live, Some("is_live" | "is_upcoming")) {
+                return None;
+            }
+            let title = e.get("title")?.as_str()?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            let channel = ["channel", "uploader"]
+                .iter()
+                .find_map(|k| e.get(*k).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(String::from);
+            Some(SearchHit {
+                youtube_id: id.to_string(),
+                title: title.to_string(),
+                channel,
+                duration_ms: duration_ms(e),
+            })
+        })
+        .collect()
+}
+
 fn fake_metadata(r: &YoutubeRef) -> Vec<TrackInfo> {
     match r {
         YoutubeRef::Video(id) => vec![TrackInfo {
@@ -406,6 +536,25 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].duration_ms, Some(10_000));
         assert_eq!(t[1].duration_ms, None);
+    }
+
+    #[test]
+    fn parses_search_json() {
+        let v: Value = serde_json::from_str(
+            r#"{"_type":"playlist","entries":[
+                {"id":"1kHwMPKjDe0","title":"RASTA - MATEMATIKA","duration":201.0,"channel":"Balkaton"},
+                {"id":"liveliveliv","title":"Radio","duration":null,"live_status":"is_live"},
+                {"id":"bad","title":"x"},
+                {"id":"KOGOPKRQ_qU","title":"Tekst","uploader":"Dj"}]}"#,
+        )
+        .unwrap();
+        let hits = parse_search(&v);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].channel.as_deref(), Some("Balkaton"));
+        assert_eq!(hits[0].duration_ms, Some(201_000));
+        assert_eq!(hits[1].channel.as_deref(), Some("Dj"));
+        assert_eq!(hits[1].duration_ms, None);
+        assert!(parse_search(&serde_json::json!({})).is_empty());
     }
 
     #[test]

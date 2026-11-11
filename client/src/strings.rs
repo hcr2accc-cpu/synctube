@@ -32,7 +32,15 @@ pub const OFFLINE: &str = "Nije povezano";
 // Room screen
 pub const LEAVE: &str = "Izađi";
 pub const NOTHING_PLAYING: &str = "Ništa ne svira. Dodaj YouTube link ispod.";
-pub const PASTE_LINK: &str = "Nalepi YouTube link (pesma ili plejlista)";
+pub const PASTE_LINK: &str = "Nalepi YouTube link ili ukucaj šta tražiš";
+pub const SEARCH: &str = "Traži";
+pub const SEARCH_TITLE: &str = "Pretraga";
+pub const BACK_TO_QUEUE: &str = "Nazad na red";
+pub const ADD_TO_QUEUE: &str = "Dodaj u red";
+pub const IN_QUEUE: &str = "Već je u redu";
+pub const SEARCHING: &str = "Tražim na YouTube-u…";
+pub const SEARCH_NOTHING: &str = "Ništa nije pronađeno.";
+pub const SEARCH_HINT: &str = "dupli klik ili + dodaje pesmu u red";
 pub const ADD: &str = "Dodaj";
 pub const ADDING: &str = "Učitavam link…";
 pub const QUEUE: &str = "Red pesama";
@@ -63,6 +71,7 @@ pub const CLOCK_SYNCING: &str = "Usklađujem sat…";
 
 // Errors / toasts
 pub const RESOLVE_FAILED: &str = "Ne mogu da učitam pesmu sa YouTube-a.";
+pub const SEARCH_FAILED: &str = "Pretraga nije uspela.";
 pub const RESOLVE_TIMEOUT: &str = "YouTube predugo ne odgovara.";
 pub const NOT_YOUTUBE: &str = "To nije ispravan YouTube link.";
 pub const NOTHING_FOUND: &str = "Na tom linku nema pesama.";
@@ -101,18 +110,18 @@ pub const ADVANCED: &str = "Napredno";
 pub const ROOM_HINT: &str = "npr. ekipa";
 pub const NICK_HINT: &str = "kako da te zovu";
 pub const NOTHING_PLAYING_TITLE: &str = "Ništa ne svira";
-pub const NOTHING_PLAYING_HINT: &str = "Dodaj YouTube link ispod ili pritisni Ctrl+V.";
+pub const NOTHING_PLAYING_HINT: &str = "Potraži pesmu ili nalepi YouTube link ispod.";
 pub const PASTE_HINT: &str =
-    "Enter dodaje · Ctrl+V bilo gde u prozoru odmah dodaje link · Razmak pušta/pauzira";
+    "Enter dodaje link ili traži · Ctrl+V bilo gde u prozoru odmah dodaje link · Razmak pušta/pauzira";
 pub const SEARCH_QUEUE: &str = "Pretraži red…";
 pub const JUMP_TO_CURRENT: &str = "Idi na trenutnu pesmu";
 pub const PLAY_NEXT: &str = "Pusti posle trenutne";
-pub const DOUBLE_CLICK_HINT: &str = "dvoklik pušta pesmu";
+pub const DOUBLE_CLICK_HINT: &str = "prevuci za redosled · klik na sliku pušta";
 pub const LOADING_PLAYLIST: &str = "Učitavam plejlistu…";
 pub const LOADING_TRACK: &str = "Učitavam pesmu…";
 pub const QUEUE_EMPTY_TITLE: &str = "Red je prazan";
 pub const QUEUE_EMPTY_HINT: &str =
-    "Nalepi YouTube link ispod ili pritisni Ctrl+V bilo gde u prozoru.";
+    "Potraži pesmu ili nalepi YouTube link ispod (Ctrl+V radi bilo gde u prozoru).";
 pub const NO_MATCHES: &str = "Nijedna pesma ne odgovara pretrazi.";
 pub const SYNC_TITLE: &str = "Sinhronizacija";
 pub const STATUS: &str = "Status";

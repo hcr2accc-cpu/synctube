@@ -81,17 +81,16 @@ impl Player {
         }
     }
 
-    pub async fn set_normalize(&self, on: bool) {
+    /// Fixed per-song gain in dB (loudness normalization). mpv applies it in
+    /// its mixer, so it does not touch timing or the sound itself.
+    pub async fn set_gain(&self, db: f64) {
         match self {
             Player::Mpv(m) => {
-                if let Err(e) = m
-                    .set_property("af", json!(crate::mpv::audio_filter(on)))
-                    .await
-                {
-                    tracing::warn!("cannot set audio filter: {e}");
+                if let Err(e) = m.set_property("volume-gain", json!(db)).await {
+                    tracing::warn!("cannot set volume gain: {e}");
                 }
             }
-            Player::Fake(f) => f.state.lock().unwrap().normalize = on,
+            Player::Fake(f) => f.state.lock().unwrap().gain_db = db,
         }
     }
 
@@ -135,7 +134,7 @@ pub struct FakeState {
     speed: f64,
     duration_ms: Option<u64>,
     pub volume: f64,
-    pub normalize: bool,
+    pub gain_db: f64,
 }
 
 impl FakeState {
@@ -176,7 +175,7 @@ impl FakePlayer {
             speed: 1.0,
             duration_ms: None,
             volume: 100.0,
-            normalize: false,
+            gain_db: 0.0,
         }));
         // Background ticker: finishes simulated loads and detects EOF.
         let st = state.clone();

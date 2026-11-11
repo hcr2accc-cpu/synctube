@@ -7,6 +7,7 @@ pub mod engine;
 pub mod gui;
 pub mod icons;
 pub mod logging;
+pub mod loudness;
 pub mod mpv;
 pub mod net;
 pub mod paths;

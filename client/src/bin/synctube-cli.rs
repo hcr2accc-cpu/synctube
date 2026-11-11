@@ -22,6 +22,7 @@ struct Args {
     fake_rate: f64,
     no_update: bool,
     volume: f64,
+    normalize: bool,
     status_every: Option<f64>,
 }
 
@@ -35,6 +36,7 @@ fn parse_args() -> Result<Args, String> {
         fake_rate: 1.0,
         no_update: false,
         volume: 70.0,
+        normalize: false,
         status_every: Some(2.0),
     };
     let mut it = std::env::args().skip(1);
@@ -48,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
             "--fake-audio" => a.fake_audio = true,
             "--fake-rate" => a.fake_rate = val()?.parse().map_err(|_| "bad --fake-rate")?,
             "--no-update" => a.no_update = true,
+            "--normalize" => a.normalize = true,
             "--volume" => a.volume = val()?.parse().map_err(|_| "bad --volume")?,
             "--status-every" => {
                 let s: f64 = val()?.parse().map_err(|_| "bad --status-every")?;
@@ -56,7 +59,7 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => {
                 println!(
                     "synctube-cli --server URL --room ROOM --name NAME [--password P] \
-                     [--fake-audio] [--fake-rate R] [--no-update] [--volume 0-100] [--status-every SECS]"
+                     [--fake-audio] [--fake-rate R] [--no-update] [--normalize] [--volume 0-100] [--status-every SECS]"
                 );
                 std::process::exit(0);
             }
@@ -107,7 +110,7 @@ fn main() {
         fake_rate: args.fake_rate,
         tools: Tools::discover(),
         volume: args.volume,
-        normalize: false,
+        normalize: args.normalize,
         auto_update: !args.no_update && !args.fake_audio,
     };
     let handle = engine::start(cfg, Arc::new(|| {}));

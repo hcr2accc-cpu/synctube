@@ -71,6 +71,10 @@ jobs:
     needs: [windows, linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          sparse-checkout: .github/release-notes
       - uses: actions/download-artifact@v4
         with:
           path: out
@@ -80,8 +84,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --verify-tag --title "SyncTube $TAG" --notes "$(cat <<'EOF'
+          # What's new in this version: .github/release-notes/<tag>.md, if written.
+          NOTES=".github/release-notes/$TAG.md"
+          if [ ! -f "$NOTES" ]; then
+            NOTES=default-notes.md
+            cat > "$NOTES" <<'EOF'
           SyncTube za Windows i Linux.
 
           - **Windows**: preuzmi `synctube.exe` i pokreni ga.
@@ -89,5 +96,6 @@ jobs:
 
           Adresu servera dobijaš privatno od onoga ko te poziva u sobu.
           EOF
-          )"
+          fi
+          gh release view "$TAG" >/dev/null 2>&1 ||             gh release create "$TAG" --verify-tag --title "SyncTube $TAG" --notes-file "$NOTES"
           gh release upload "$TAG" out/synctube.exe out/synctube-linux-x86_64.tar.gz --clobber
