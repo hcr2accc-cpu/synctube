@@ -12,7 +12,7 @@ fn main() {
         // First run of the `write_ico` test generates it.
         return;
     }
-    let out =std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let rc = out.join("synctube.rc");
     let icon = icon.to_string_lossy().replace('\\', "/");
     std::fs::write(&rc, format!("1 ICON \"{icon}\"\n")).unwrap();

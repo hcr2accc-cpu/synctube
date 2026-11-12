@@ -24,21 +24,44 @@ pub const SEARCH_RESULTS: usize = 20;
 /// Duration used for synthetic tracks in fake mode without yt-dlp.
 pub const FAKE_DURATION_MS: u64 = 30_000;
 
+/// yt-dlp format selection: the audio stream, plus a separate video stream
+/// (up to 1080p, H.264 preferred for hardware decoding) for video mode.
+/// One run yields both, so video mode costs no extra resolve time; nothing
+/// is merged (mpv plays the two streams together).
+const FORMAT: &str = "bv*[height<=1080][vcodec^=avc1]+ba[ext=webm]/bv*[height<=1080]+ba[ext=webm]/bv*[height<=1080]+ba/ba[ext=webm]/ba";
+
 /// A resolved audio stream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamInfo {
     pub url: String,
     /// Known when yt-dlp reports it (used to fill in quick-added tracks).
     pub duration_ms: Option<u64>,
+    /// The matching video-only stream, for video mode.
+    pub video_url: Option<String>,
 }
 
-/// One YouTube search result.
+/// One YouTube search result: a video, or a playlist.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
+    /// Video id, or playlist id when `playlist` is set.
     pub youtube_id: String,
     pub title: String,
     pub channel: Option<String>,
     pub duration_ms: Option<u64>,
+    pub playlist: bool,
+    /// Video whose thumbnail stands for the hit.
+    pub thumb_id: Option<String>,
+}
+
+impl SearchHit {
+    /// The link that adds this hit to the queue.
+    pub fn url(&self) -> String {
+        if self.playlist {
+            shared::youtube::playlist_url(&self.youtube_id)
+        } else {
+            watch_url(&self.youtube_id)
+        }
+    }
 }
 
 type Waiters = Vec<oneshot::Sender<Result<StreamInfo, String>>>;
@@ -209,16 +232,16 @@ impl Resolver {
             return Ok(StreamInfo {
                 url: format!("fake://{id}"),
                 duration_ms: None,
+                video_url: None,
             });
         }
-        // `-J` with a single selected format puts that format's URL at the top
-        // level, so one run yields the stream URL and the duration.
+        // One `-J` run yields the stream URLs and the duration.
         let out = self
             .run(
                 &[
                     "-J",
                     "-f",
-                    "bestaudio[ext=webm]/bestaudio",
+                    FORMAT,
                     "--no-playlist",
                     "--no-warnings",
                     &watch_url(id),
@@ -266,14 +289,7 @@ impl Resolver {
                 // Same format selection as playback, so the result also warms
                 // the stream cache.
                 self.run(
-                    &[
-                        "-J",
-                        "-f",
-                        "bestaudio[ext=webm]/bestaudio",
-                        "--no-playlist",
-                        "--no-warnings",
-                        url,
-                    ],
+                    &["-J", "-f", FORMAT, "--no-playlist", "--no-warnings", url],
                     META_TIMEOUT,
                 )
                 .await?
@@ -295,28 +311,55 @@ impl Resolver {
         Ok(tracks)
     }
 
-    /// Searches YouTube for videos (titles, channels and durations only).
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>, String> {
+    /// Searches YouTube for videos or playlists (titles, channels and
+    /// durations only).
+    pub async fn search(&self, query: &str, playlists: bool) -> Result<Vec<SearchHit>, String> {
         if self.yt_dlp.is_none() && self.fake {
             return Ok((0..5)
                 .map(|i| SearchHit {
-                    youtube_id: format!("fakesearch{i}"),
+                    youtube_id: if playlists {
+                        format!("PLfakesearch{i}")
+                    } else {
+                        format!("fakesearch{i}")
+                    },
                     title: format!("{query} {}", i + 1),
                     channel: Some("Test".into()),
-                    duration_ms: Some(FAKE_DURATION_MS),
+                    duration_ms: (!playlists).then_some(FAKE_DURATION_MS),
+                    playlist: playlists,
+                    thumb_id: None,
                 })
                 .collect());
         }
-        let target = format!("ytsearch{SEARCH_RESULTS}:{query}");
+        let target = if playlists {
+            // YouTube's own results page with the "playlists only" filter.
+            format!(
+                "https://www.youtube.com/results?search_query={}&sp=EgIQAw%253D%253D",
+                url_encode(query)
+            )
+        } else {
+            format!("ytsearch{SEARCH_RESULTS}:{query}")
+        };
+        let end = SEARCH_RESULTS.to_string();
         let json = self
             .run(
-                &["--flat-playlist", "-J", "--no-warnings", &target],
+                &[
+                    "--flat-playlist",
+                    "-J",
+                    "--no-warnings",
+                    "--playlist-end",
+                    &end,
+                    &target,
+                ],
                 SEARCH_TIMEOUT,
             )
             .await?;
         let v: Value =
             serde_json::from_str(&json).map_err(|_| strings::SEARCH_FAILED.to_string())?;
-        Ok(parse_search(&v))
+        Ok(if playlists {
+            parse_playlist_search(&v)
+        } else {
+            parse_search(&v)
+        })
     }
 
     /// `yt-dlp --version`.
@@ -402,15 +445,34 @@ fn oembed_title(id: &str) -> Result<String, String> {
         .ok_or_else(|| "no title".into())
 }
 
-/// Parses `yt-dlp -J -f <single format>` output.
+/// Parses `yt-dlp -J -f <FORMAT>` output: either one format (its URL at the
+/// top level) or a video+audio pair in `requested_formats`.
 pub fn parse_stream_info(v: &Value) -> Option<StreamInfo> {
-    let url = v
-        .get("url")
-        .and_then(Value::as_str)
-        .filter(|u| u.starts_with("http"))?;
+    let http = |f: &Value| -> Option<String> {
+        f.get("url")
+            .and_then(Value::as_str)
+            .filter(|u| u.starts_with("http"))
+            .map(String::from)
+    };
+    let codec = |f: &Value, k: &str| f.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let pair = v.get("requested_formats").and_then(Value::as_array);
+    let audio = pair.and_then(|p| {
+        p.iter()
+            .find(|f| codec(f, "vcodec") == "none" && codec(f, "acodec") != "none")
+            .and_then(http)
+    });
+    let video_url = pair.and_then(|p| {
+        p.iter()
+            .find(|f| {
+                codec(f, "acodec") == "none" && !matches!(codec(f, "vcodec").as_str(), "" | "none")
+            })
+            .and_then(http)
+    });
+    let url = audio.or_else(|| http(v))?;
     Some(StreamInfo {
-        url: url.to_string(),
+        url,
         duration_ms: duration_ms(v),
+        video_url,
     })
 }
 
@@ -485,9 +547,73 @@ pub fn parse_search(v: &Value) -> Vec<SearchHit> {
                 title: title.to_string(),
                 channel,
                 duration_ms: duration_ms(e),
+                playlist: false,
+                thumb_id: Some(id.to_string()),
             })
         })
         .collect()
+}
+
+/// Parses `yt-dlp --flat-playlist -J` output of a playlist-filtered
+/// results page.
+pub fn parse_playlist_search(v: &Value) -> Vec<SearchHit> {
+    let Some(entries) = v.get("entries").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|e| {
+            let url = e.get("url").and_then(Value::as_str).unwrap_or("");
+            let Some(YoutubeRef::Playlist(id)) = parse_youtube_url(url) else {
+                return None;
+            };
+            let title = e.get("title")?.as_str()?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            let channel = ["channel", "uploader"]
+                .iter()
+                .find_map(|k| e.get(*k).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(String::from);
+            let thumb_id = e
+                .get("thumbnails")
+                .and_then(Value::as_array)
+                .and_then(|t| t.iter().find_map(|t| t.get("url")?.as_str()))
+                .and_then(thumb_video_id);
+            Some(SearchHit {
+                youtube_id: id,
+                title: title.to_string(),
+                channel,
+                duration_ms: None,
+                playlist: true,
+                thumb_id,
+            })
+        })
+        .collect()
+}
+
+/// `https://i.ytimg.com/vi/<id>/hq720.jpg?...` → `<id>`.
+fn thumb_video_id(url: &str) -> Option<String> {
+    let rest = url.split("/vi/").nth(1)?;
+    let id = rest.split('/').next()?;
+    shared::youtube::is_valid_video_id(id).then(|| id.to_string())
+}
+
+/// Percent-encodes a search query for a URL.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn fake_metadata(r: &YoutubeRef) -> Vec<TrackInfo> {
@@ -558,6 +684,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_playlist_search_json() {
+        let v: Value = serde_json::from_str(
+            r#"{"_type":"playlist","entries":[
+                {"title":"BALKAN HITS","channel":"Balkan Music","ie_key":"YoutubeTab",
+                 "id":"PLToeUUa9hjL2FrcLwjcqOM5g69G3gqnpQ",
+                 "url":"https://www.youtube.com/playlist?list=PLToeUUa9hjL2FrcLwjcqOM5g69G3gqnpQ",
+                 "thumbnails":[{"url":"https://i.ytimg.com/vi/doedUH-xATc/hq720.jpg?sqp=x"}]},
+                {"title":"A video","id":"dQw4w9WgXcQ","url":"https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+                {"title":"","url":"https://www.youtube.com/playlist?list=PLxNwmlAj-awdk7n0Bd28CSY4_O1yqsLY2"}]}"#,
+        )
+        .unwrap();
+        let hits = parse_playlist_search(&v);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].playlist);
+        assert_eq!(hits[0].youtube_id, "PLToeUUa9hjL2FrcLwjcqOM5g69G3gqnpQ");
+        assert_eq!(hits[0].thumb_id.as_deref(), Some("doedUH-xATc"));
+        assert_eq!(hits[0].channel.as_deref(), Some("Balkan Music"));
+        assert!(hits[0]
+            .url()
+            .ends_with("list=PLToeUUa9hjL2FrcLwjcqOM5g69G3gqnpQ"));
+        assert_eq!(url_encode("ceca & 2026"), "ceca+%26+2026");
+        assert_eq!(url_encode("đ"), "%C4%91");
+    }
+
+    #[test]
     fn parses_stream_info_json() {
         let v: Value = serde_json::from_str(
             r#"{"id":"dQw4w9WgXcQ","duration":213,"format_id":"251","url":"https://rr1.googlevideo.com/x"}"#,
@@ -566,7 +717,20 @@ mod tests {
         let s = parse_stream_info(&v).unwrap();
         assert_eq!(s.url, "https://rr1.googlevideo.com/x");
         assert_eq!(s.duration_ms, Some(213_000));
+        assert_eq!(s.video_url, None);
         let v: Value = serde_json::from_str(r#"{"id":"dQw4w9WgXcQ"}"#).unwrap();
         assert!(parse_stream_info(&v).is_none());
+        let v: Value = serde_json::from_str(
+            r#"{"id":"dQw4w9WgXcQ","duration":213,"format_id":"137+251","requested_formats":[
+                {"format_id":"137","vcodec":"avc1.640028","acodec":"none","url":"https://v.googlevideo.com/video"},
+                {"format_id":"251","vcodec":"none","acodec":"opus","url":"https://v.googlevideo.com/audio"}]}"#,
+        )
+        .unwrap();
+        let s = parse_stream_info(&v).unwrap();
+        assert_eq!(s.url, "https://v.googlevideo.com/audio");
+        assert_eq!(
+            s.video_url.as_deref(),
+            Some("https://v.googlevideo.com/video")
+        );
     }
 }

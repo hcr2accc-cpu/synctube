@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use shared::sync::{decide_drift, expected_position_clamped, to_server_ms, DriftAction};
-use shared::{ClientMsg, Member, PlayStatus, RoomState, ServerMsg, TrackInfo};
+use shared::{ClientMsg, Member, MemberSync, PlayStatus, RoomState, ServerMsg, TrackInfo};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -32,6 +32,12 @@ pub struct EngineConfig {
     pub normalize: bool,
     /// Run `yt-dlp -U` in the background on start.
     pub auto_update: bool,
+    /// Local equalizer.
+    pub eq: crate::eq::EqSettings,
+    /// Show each song's video.
+    pub video: bool,
+    /// Native window inside the app that the video is drawn into.
+    pub video_wid: Option<i64>,
 }
 
 /// Commands from the UI.
@@ -54,11 +60,17 @@ pub enum Command {
     Remove(Uuid),
     Move(Uuid, usize),
     Add(String),
-    /// Searches YouTube; results show up in [`View::search`].
-    Search(String),
+    /// Searches YouTube (videos, or playlists); results show up in
+    /// [`View::search`].
+    Search {
+        query: String,
+        playlists: bool,
+    },
     ClearSearch,
     SetVolume(f64),
     SetNormalize(bool),
+    SetEq(crate::eq::EqSettings),
+    SetVideo(bool),
     SetTools(Tools),
     Shutdown,
 }
@@ -106,6 +118,8 @@ pub struct PendingAdd {
 #[derive(Debug, Clone, Default)]
 pub struct SearchView {
     pub query: String,
+    /// Playlists instead of videos.
+    pub playlists: bool,
     pub loading: bool,
     pub results: Vec<SearchHit>,
     pub error: Option<String>,
@@ -141,9 +155,22 @@ pub struct View {
     pub ytdlp_version: Option<String>,
     pub ytdlp_updating: bool,
     pub fake_audio: bool,
+    /// Bumped when the user closed the video window (video mode turned off).
+    pub video_closed: u64,
 }
 
 impl View {
+    /// This client's player as the room sees it (the sync dots).
+    pub fn sync(&self) -> MemberSync {
+        MemberSync {
+            loading: matches!(self.phase, Phase::Resolving | Phase::Buffering),
+            drift_ms: match self.phase {
+                Phase::Playing => self.drift_ms.map(|d| d.clamp(-10_000, 10_000) as i32),
+                _ => None,
+            },
+        }
+    }
+
     pub fn server_now_ms(&self) -> u64 {
         to_server_ms(local_ms(), self.offset_ms)
     }
@@ -248,6 +275,12 @@ struct Cur {
     reresolved: bool,
     /// Loudness still being measured: wait for it at most until then.
     gain_deadline: Option<Instant>,
+    /// The song's video stream (for video mode).
+    video_url: Option<String>,
+    /// The video track is open in the player.
+    video_loaded: bool,
+    /// Playing from the disk cache.
+    local: bool,
 }
 
 enum TaskResult {
@@ -274,12 +307,18 @@ enum TaskResult {
         youtube_id: String,
         result: Result<crate::loudness::Loudness, String>,
     },
+    Prepared {
+        youtube_id: String,
+        result: Result<(), String>,
+    },
 }
 
 const PING_BURST: u8 = 8;
 const PING_SPACING: Duration = Duration::from_millis(100);
 const RESYNC_EVERY: Duration = Duration::from_secs(30);
 const DRIFT_EVERY: Duration = Duration::from_secs(1);
+/// At most this often while only the drift number changes.
+const STATUS_MIN_GAP: Duration = Duration::from_millis(400);
 /// Wake up this much before a scheduled unpause and spin the rest (Windows
 /// timers are coarse).
 const SPIN_MS: u64 = 16;
@@ -292,6 +331,9 @@ const ADD_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 const GAIN_WAIT: Duration = Duration::from_millis(2500);
 /// How many upcoming songs are measured ahead, one at a time.
 const MEASURE_AHEAD: usize = 5;
+/// The next song starts downloading to disk this long after the current one
+/// started playing (its own buffer fills first).
+const PREPARE_DELAY: Duration = Duration::from_secs(3);
 
 /// One submitted link, from `Add` until `AddResolved` is sent.
 struct AddJob {
@@ -357,6 +399,18 @@ struct Engine {
     measuring_ahead: Option<String>,
     /// Measured loudness, kept on disk so a song is scanned only once.
     loudness_store: crate::loudness::Store,
+    /// Upcoming songs' audio on disk, so a skip starts at once.
+    cache: Option<crate::cache::AudioCache>,
+    /// When to start preparing the next song.
+    prepare_at: Option<Instant>,
+    /// The song being downloaded to the cache (one at a time).
+    preparing: Option<String>,
+    /// Like `load_comp_ms`, for songs loaded from the cache.
+    load_comp_local_ms: u64,
+    /// The server relays member status (older servers reject the message).
+    status_ok: bool,
+    /// Last status reported to the room, and when.
+    status_sent: Option<(MemberSync, Instant)>,
 }
 
 async fn sleep_opt(at: Option<Instant>) {
@@ -430,6 +484,12 @@ impl Engine {
             measure_retried: HashSet::new(),
             measuring_ahead: None,
             loudness_store: crate::loudness::Store::default(),
+            cache: None,
+            prepare_at: None,
+            preparing: None,
+            load_comp_local_ms: 250,
+            status_ok: false,
+            status_sent: None,
         }
     }
 
@@ -441,6 +501,9 @@ impl Engine {
             for (id, l) in self.loudness_store.iter() {
                 self.gains.insert(id.clone(), l.gain_db());
             }
+            self.cache = Some(crate::cache::AudioCache::new(
+                crate::paths::app_dir().join("cache"),
+            ));
         }
         loop {
             let spin_target = self.unpause_at;
@@ -470,6 +533,7 @@ impl Engine {
                 _ = sleep_opt(self.next_drift) => self.drift_check().await,
                 _ = sleep_opt(self.next_ping) => self.ping_tick(),
                 _ = sleep_opt(gain_hold) => self.release_gain_hold().await,
+                _ = sleep_opt(self.prepare_at) => self.prepare_next(),
             }
             self.publish();
         }
@@ -484,6 +548,7 @@ impl Engine {
         self.view.clock_synced = self.clock.is_synced();
         self.view.phase = self.phase();
         self.view.speed = self.cur.as_ref().map_or(1.0, |c| c.speed);
+        self.report_status();
         self.adds
             .retain(|j| j.request_id.is_some() || j.started.elapsed() < ADD_ANSWER_TIMEOUT);
         self.view.pending_adds = self
@@ -525,6 +590,35 @@ impl Engine {
                 PlayStatus::Stopped => Phase::Idle,
             },
         }
+    }
+
+    /// Tells the room how this player is doing, when that changes.
+    fn report_status(&mut self) {
+        if !self.status_ok || !self.view.joined {
+            return;
+        }
+        let mut now = self.view.sync();
+        // Drift inside the tolerance is "in sync"; beyond it, coarse steps
+        // are enough for a dot on a screen.
+        now.drift_ms = now.drift_ms.map(|d| {
+            if (d as i64).abs() <= shared::sync::DRIFT_IGNORE_MS {
+                0
+            } else {
+                d / 20 * 20
+            }
+        });
+        if let Some((last, at)) = self.status_sent {
+            let same_kind =
+                last.loading == now.loading && last.drift_ms.is_some() == now.drift_ms.is_some();
+            if last == now || (same_kind && at.elapsed() < STATUS_MIN_GAP) {
+                return;
+            }
+        }
+        self.status_sent = Some((now, Instant::now()));
+        self.send(ClientMsg::Status {
+            loading: now.loading,
+            drift_ms: now.drift_ms,
+        });
     }
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
@@ -585,7 +679,7 @@ impl Engine {
                     self.send(ClientMsg::Add { url });
                 }
             },
-            Command::Search(query) => {
+            Command::Search { query, playlists } => {
                 let query = query.trim().to_string();
                 if query.is_empty() {
                     return;
@@ -594,13 +688,14 @@ impl Engine {
                 let seq = self.search_seq;
                 self.view.search = SearchView {
                     query: query.clone(),
+                    playlists,
                     loading: true,
                     ..SearchView::default()
                 };
                 let resolver = self.resolver.clone();
                 let tx = self.task_tx.clone();
                 tokio::spawn(async move {
-                    let result = resolver.search(&query).await;
+                    let result = resolver.search(&query, playlists).await;
                     let _ = tx.send(TaskResult::Search { seq, result });
                 });
             }
@@ -622,6 +717,8 @@ impl Engine {
                 }
                 self.apply_gain().await;
             }
+            Command::SetEq(eq) => self.set_eq(eq.clamped()).await,
+            Command::SetVideo(on) => self.set_video(on).await,
             Command::SetTools(tools) => {
                 let had_ytdlp = self.cfg.tools.yt_dlp.is_some();
                 self.resolver.set_path(tools.yt_dlp.clone());
@@ -721,6 +818,8 @@ impl Engine {
                 tracing::info!(room = %room_state.name, "joined");
                 self.view.conn = ConnState::Connected;
                 self.view.joined = true;
+                self.status_ok = you.sync.is_some();
+                self.status_sent = None;
                 self.view.me = Some(you);
                 self.clock.set_rough(server_ms);
                 self.pings_left = 0;
@@ -861,6 +960,17 @@ impl Engine {
                 Err(e) => tracing::debug!(youtube_id, "duration lookup failed: {e}"),
             },
             TaskResult::Stream { track_id, result } => self.on_stream(track_id, result).await,
+            TaskResult::Prepared { youtube_id, result } => {
+                if self.preparing.as_deref() == Some(youtube_id.as_str()) {
+                    self.preparing = None;
+                }
+                match result {
+                    Ok(()) => tracing::info!(youtube_id, "next song is on disk"),
+                    Err(e) => tracing::debug!(youtube_id, "preparing failed: {e}"),
+                }
+                // The queue may have moved on meanwhile.
+                self.schedule_prepare(Duration::ZERO);
+            }
             TaskResult::Search { seq, result } => {
                 if seq != self.search_seq {
                     return;
@@ -1026,6 +1136,119 @@ impl Engine {
         cur.phase = CurPhase::Active;
         self.continue_positioned().await;
         self.measure_ahead();
+        self.schedule_prepare(PREPARE_DELAY);
+    }
+
+    // ----- equalizer and video ----------------------------------------------------
+
+    async fn set_eq(&mut self, eq: crate::eq::EqSettings) {
+        let old = std::mem::replace(&mut self.cfg.eq, eq.clone());
+        let Some(p) = &self.player else { return };
+        if old.enabled != eq.enabled {
+            p.set_af(&crate::eq::af_value(&eq)).await;
+            return;
+        }
+        if !eq.enabled {
+            return;
+        }
+        // Same filter, new gains: changed in place (no rebuild, no dropout).
+        for (i, (a, b)) in old.gains.iter().zip(eq.gains.iter()).enumerate() {
+            if (a - b).abs() > 0.01 {
+                p.eq_command(&crate::eq::band_target(i), "g", &format!("{b:.1}"))
+                    .await;
+            }
+        }
+        if (old.preamp_db() - eq.preamp_db()).abs() > 0.01 {
+            p.eq_command(
+                crate::eq::PREAMP_TARGET,
+                "volume",
+                &format!("{:.1}dB", eq.preamp_db()),
+            )
+            .await;
+        }
+    }
+
+    async fn set_video(&mut self, on: bool) {
+        self.cfg.video = on;
+        let Some(p) = &self.player else { return };
+        p.set_video(on).await;
+        if !on {
+            return;
+        }
+        // Turned on mid-song: open this song's video in the background.
+        let add = self.cur.as_mut().and_then(|c| {
+            let ready = matches!(
+                c.phase,
+                CurPhase::Active | CurPhase::AwaitGain | CurPhase::Seeking
+            );
+            if ready && !c.video_loaded {
+                c.video_loaded = c.video_url.is_some();
+                c.video_url.clone()
+            } else {
+                None
+            }
+        });
+        if let Some(url) = add {
+            p.add_video(&url).await;
+        }
+    }
+
+    // ----- next song on disk --------------------------------------------------------
+
+    fn schedule_prepare(&mut self, delay: Duration) {
+        if self.cache.is_none() || self.prepare_at.is_some() || self.preparing.is_some() {
+            return;
+        }
+        let active = self
+            .cur
+            .as_ref()
+            .is_some_and(|c| c.phase == CurPhase::Active);
+        if active && self.next_to_prepare().is_some() {
+            self.prepare_at = Some(Instant::now() + delay);
+        }
+    }
+
+    /// The next song in the queue, if it is not on disk yet.
+    fn next_to_prepare(&self) -> Option<String> {
+        let cache = self.cache.as_ref()?;
+        let room = self.room.as_ref()?;
+        let i = room.playback.track_index?;
+        let next = room.queue.get(i + 1)?;
+        let id = &next.youtube_id;
+        (cache.path(id).is_none() && !cache.busy(id)).then(|| id.clone())
+    }
+
+    fn prepare_next(&mut self) {
+        self.prepare_at = None;
+        if self.preparing.is_some()
+            || !self
+                .cur
+                .as_ref()
+                .is_some_and(|c| c.phase == CurPhase::Active)
+        {
+            return;
+        }
+        let (Some(cache), Some(id)) = (self.cache.clone(), self.next_to_prepare()) else {
+            return;
+        };
+        self.preparing = Some(id.clone());
+        let resolver = self.resolver.clone();
+        let tx = self.task_tx.clone();
+        tokio::spawn(async move {
+            let result = match resolver.stream_info_background(&id).await {
+                Ok(info) => {
+                    let (c, i) = (cache, id.clone());
+                    tokio::task::spawn_blocking(move || c.download(&i, &info.url))
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
+                }
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(TaskResult::Prepared {
+                youtube_id: id,
+                result,
+            });
+        });
     }
 
     // ----- player -----------------------------------------------------------------
@@ -1046,7 +1269,13 @@ impl Engine {
             self.view.player_error = Some(strings::MPV_MISSING.into());
             return;
         };
-        match crate::mpv::Mpv::spawn(&mpv, self.view.volume, self.player_tx.clone()).await {
+        let opts = crate::mpv::SpawnOpts {
+            volume: self.view.volume,
+            video: self.cfg.video,
+            af: crate::eq::af_value(&self.cfg.eq),
+            wid: self.cfg.video_wid,
+        };
+        match crate::mpv::Mpv::spawn(&mpv, &opts, self.player_tx.clone()).await {
             Ok(m) => {
                 self.view.player_error = None;
                 self.player = Some(Player::Mpv(Box::new(m)));
@@ -1096,7 +1325,16 @@ impl Engine {
                     return;
                 }
                 tracing::warn!(id = %cur.youtube_id, "playback failed: {error}");
-                if !cur.reresolved {
+                if cur.local {
+                    // A bad cached file: drop it and stream instead.
+                    cur.local = false;
+                    cur.phase = CurPhase::Resolving;
+                    let (id, track_id) = (cur.youtube_id.clone(), cur.track_id);
+                    if let Some(c) = &self.cache {
+                        c.forget(&id);
+                    }
+                    self.spawn_resolve(track_id, id);
+                } else if !cur.reresolved {
                     // The cached URL may have expired: resolve again once.
                     cur.reresolved = true;
                     cur.phase = CurPhase::Resolving;
@@ -1106,6 +1344,11 @@ impl Engine {
                 } else {
                     self.give_up_track().await;
                 }
+            }
+            PlayerEvent::VideoClosed => {
+                tracing::info!("video window closed: video mode off");
+                self.set_video(false).await;
+                self.view.video_closed += 1;
             }
             PlayerEvent::Crashed => {
                 tracing::error!("player crashed");
@@ -1236,8 +1479,10 @@ impl Engine {
         let since = self.track_t0.map(|t| t.elapsed().as_millis() as u64);
         tracing::info!(since_ms = since, "stream resolved");
         let Some(cur) = &mut self.cur else { return };
+        let cached = self.cache.as_ref().and_then(|c| c.path(&cur.youtube_id));
         let url = match result {
             Ok(info) => {
+                cur.video_url = info.video_url.clone();
                 if let (None, Some(d)) = (cur.duration_ms, info.duration_ms) {
                     // Track was quick-added without a duration: tell everyone.
                     cur.duration_ms = Some(d);
@@ -1249,11 +1494,24 @@ impl Engine {
                 }
                 info.url
             }
+            Err(_) if cached.is_some() => String::new(),
             Err(e) => {
                 tracing::warn!("resolve failed twice: {e}");
                 self.give_up_track().await;
                 return;
             }
+        };
+        let (url, local) = match cached {
+            Some(p) => (p.to_string_lossy().into_owned(), true),
+            None => (url, false),
+        };
+        if let Some(c) = &mut self.cur {
+            c.local = local;
+        }
+        let comp = if local {
+            self.load_comp_local_ms
+        } else {
+            self.load_comp_ms
         };
         self.ensure_player().await;
         let Some(room) = self.room.clone() else {
@@ -1263,7 +1521,7 @@ impl Engine {
         let start = match pb.status {
             PlayStatus::Playing if self.server_now() >= pb.anchor_server_ms => {
                 // Late joiner: aim where the timeline will be once loaded.
-                pb.position_at(self.server_now()) + self.load_comp_ms
+                pb.position_at(self.server_now()) + comp
             }
             _ => pb.anchor_position_ms,
         };
@@ -1281,17 +1539,30 @@ impl Engine {
             }
         }
         self.apply_gain().await;
+        let title = room
+            .current_track()
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        let video = self
+            .cur
+            .as_ref()
+            .filter(|_| self.cfg.video)
+            .and_then(|c| c.video_url.clone());
         let Some(player) = &self.player else { return };
-        match player.load(&url, start, duration).await {
+        match player
+            .load(&url, start, duration, &title, video.as_deref())
+            .await
+        {
             Ok(entry) => {
                 if let Some(c) = &mut self.cur {
                     c.entry = entry;
                     c.phase = CurPhase::Loading;
                     c.paused = true;
                     c.speed = 1.0;
+                    c.video_loaded = video.is_some();
                 }
                 self.op_started = Some(Instant::now());
-                tracing::info!(start, "loading track");
+                tracing::info!(start, local, "loading track");
             }
             Err(e) => {
                 tracing::warn!("load failed: {e}");
@@ -1309,8 +1580,15 @@ impl Engine {
         match cur.phase {
             CurPhase::Loading => {
                 if let Some(ms) = took {
-                    self.load_comp_ms = ewma(self.load_comp_ms, ms.clamp(200, 8000));
-                    tracing::info!(ms, comp = self.load_comp_ms, "track loaded");
+                    if cur.local {
+                        self.load_comp_local_ms = ewma(self.load_comp_local_ms, ms.clamp(50, 8000));
+                        tracing::info!(ms, comp = self.load_comp_local_ms, "track loaded (disk)");
+                    } else if !cur.video_loaded {
+                        // Loads with a video track take longer; keep them
+                        // out of the audio-only estimate.
+                        self.load_comp_ms = ewma(self.load_comp_ms, ms.clamp(200, 8000));
+                        tracing::info!(ms, comp = self.load_comp_ms, "track loaded");
+                    }
                 }
             }
             CurPhase::Seeking => {
@@ -1330,6 +1608,7 @@ impl Engine {
         cur.phase = CurPhase::Active;
         self.continue_positioned().await;
         self.measure_ahead();
+        self.schedule_prepare(PREPARE_DELAY);
     }
 
     /// After a load or seek finished: report ready or join the timeline.
@@ -1376,6 +1655,7 @@ impl Engine {
         }
         // Measure upcoming songs ahead, so they start at the right level.
         self.measure_ahead();
+        self.schedule_prepare(PREPARE_DELAY);
         // The next song's URL is ready before it is needed (the queue can
         // change at any time, so this is checked on every update).
         if let Some(next) = room
@@ -1402,8 +1682,24 @@ impl Engine {
                 speed: 1.0,
                 reresolved: false,
                 gain_deadline: None,
+                video_url: None,
+                video_loaded: false,
+                local: false,
             });
-            self.spawn_resolve(track.id, track.youtube_id.clone());
+            let on_disk = self
+                .cache
+                .as_ref()
+                .and_then(|c| c.path(&track.youtube_id))
+                .is_some();
+            if on_disk && !self.cfg.video {
+                // Nothing to wait for: load from disk right away.
+                let _ = self.task_tx.send(TaskResult::Stream {
+                    track_id: track.id,
+                    result: Err(String::new()),
+                });
+            } else {
+                self.spawn_resolve(track.id, track.youtube_id.clone());
+            }
             return;
         }
         let phase = self.cur.as_ref().map(|c| c.phase);

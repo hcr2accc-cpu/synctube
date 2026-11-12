@@ -4,9 +4,9 @@
 use crate::protocol::{PlayStatus, PlaybackState};
 
 /// Below this absolute drift nothing is done.
-pub const DRIFT_IGNORE_MS: i64 = 80;
+pub const DRIFT_IGNORE_MS: i64 = 50;
 /// While nudging, return to normal speed once within this drift.
-pub const DRIFT_SETTLED_MS: i64 = 40;
+pub const DRIFT_SETTLED_MS: i64 = 20;
 /// Above this absolute drift a hard seek is performed.
 pub const DRIFT_SEEK_MS: i64 = 1000;
 /// Playback speed used to catch up when behind.
@@ -268,8 +268,8 @@ mod tests {
     #[test]
     fn drift_small_is_ignored() {
         assert_eq!(decide_drift(0, 1.0), DriftAction::None);
-        assert_eq!(decide_drift(79, 1.0), DriftAction::None);
-        assert_eq!(decide_drift(-79, 1.0), DriftAction::None);
+        assert_eq!(decide_drift(49, 1.0), DriftAction::None);
+        assert_eq!(decide_drift(-49, 1.0), DriftAction::None);
     }
 
     #[test]
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(decide_drift(200, 1.0), DriftAction::SetSpeed(SPEED_SLOW));
         assert_eq!(decide_drift(-200, 1.0), DriftAction::SetSpeed(SPEED_FAST));
         assert_eq!(decide_drift(1000, 1.0), DriftAction::SetSpeed(SPEED_SLOW));
-        assert_eq!(decide_drift(-80, 1.0), DriftAction::SetSpeed(SPEED_FAST));
+        assert_eq!(decide_drift(-50, 1.0), DriftAction::SetSpeed(SPEED_FAST));
     }
 
     #[test]
@@ -288,17 +288,17 @@ mod tests {
 
     #[test]
     fn nudging_continues_until_settled() {
-        // Behind by 60 ms while speeding up: keep going (hysteresis).
-        assert_eq!(decide_drift(-60, SPEED_FAST), DriftAction::None);
-        // Within 40 ms: back to normal.
-        assert_eq!(decide_drift(-30, SPEED_FAST), DriftAction::SetSpeed(1.0));
-        assert_eq!(decide_drift(35, SPEED_SLOW), DriftAction::SetSpeed(1.0));
+        // Behind by 40 ms while speeding up: keep going (hysteresis).
+        assert_eq!(decide_drift(-40, SPEED_FAST), DriftAction::None);
+        // Within 20 ms: back to normal.
+        assert_eq!(decide_drift(-15, SPEED_FAST), DriftAction::SetSpeed(1.0));
+        assert_eq!(decide_drift(18, SPEED_SLOW), DriftAction::SetSpeed(1.0));
     }
 
     #[test]
     fn nudging_overshoot_resets_or_reverses() {
-        // Was catching up, now 50 ms ahead: stop speeding.
-        assert_eq!(decide_drift(50, SPEED_FAST), DriftAction::SetSpeed(1.0));
+        // Was catching up, now 30 ms ahead: stop speeding.
+        assert_eq!(decide_drift(30, SPEED_FAST), DriftAction::SetSpeed(1.0));
         // Was catching up, now 300 ms ahead: reverse.
         assert_eq!(
             decide_drift(300, SPEED_FAST),

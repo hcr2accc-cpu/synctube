@@ -84,7 +84,8 @@ async fn run(
         let _ = events.send(NetEvent::Connecting { waking });
         let connect = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            tokio_tungstenite::connect_async(url.as_str()),
+            // No Nagle delay on pings and commands.
+            tokio_tungstenite::connect_async_with_config(url.as_str(), None, true),
         );
         tokio::pin!(connect);
         let mut waking_sent = waking;

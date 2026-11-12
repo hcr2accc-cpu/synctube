@@ -24,6 +24,12 @@ pub struct Config {
     pub normalize: bool,
     /// Rooms joined before, newest first (at most [`MAX_RECENT`]).
     pub recent: Vec<RecentRoom>,
+    /// Search finds playlists instead of songs.
+    pub search_playlists: bool,
+    /// Local 10-band equalizer.
+    pub eq: crate::eq::EqSettings,
+    /// Show the music video in its own window.
+    pub video: bool,
 }
 
 /// How many recent rooms are remembered.
@@ -66,6 +72,9 @@ impl Default for Config {
             volume: 70.0,
             normalize: true,
             recent: Vec::new(),
+            search_playlists: false,
+            eq: crate::eq::EqSettings::default(),
+            video: false,
         }
     }
 }

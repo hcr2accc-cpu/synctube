@@ -133,6 +133,42 @@ pub const MUTE: &str = "Isključi zvuk";
 pub const UNMUTE: &str = "Uključi zvuk";
 pub const IDLE: &str = "Spremno";
 
+// Sync dots (after a person's name)
+pub const DOT_SYNCED: &str = "u taktu";
+pub const DOT_LOADING: &str = "učitava";
+pub const DOT_WAITING: &str = "čeka";
+
+/// "žuri 120 ms" (ahead) / "kasni 120 ms" (behind).
+pub fn dot_drift(ms: i32) -> String {
+    if ms > 0 {
+        format!("žuri {ms} ms")
+    } else {
+        format!("kasni {} ms", -ms)
+    }
+}
+
+// Search modes
+pub const SEARCH_SONGS: &str = "Pesme";
+pub const SEARCH_PLAYLISTS: &str = "Plejliste";
+pub const PLAYLIST_TAG: &str = "plejlista";
+pub const SEARCH_HINT_PLAYLISTS: &str = "dupli klik ili + dodaje celu plejlistu u red";
+pub const ADD_PLAYLIST: &str = "Dodaj celu plejlistu u red";
+
+// Settings
+pub const SETTINGS: &str = "Podešavanja";
+pub const CLOSE: &str = "Zatvori";
+pub const EQ_TITLE: &str = "Ekvilajzer";
+pub const EQ_HINT: &str = "Prevuci klizač · dupli klik vraća na 0 dB · menja se samo kod tebe";
+pub const EQ_RESET: &str = "Resetuj";
+pub const EQ_CUSTOM: &str = "Prilagođeno";
+pub const VIDEO_TITLE: &str = "Video režim";
+pub const VIDEO_EXPLAIN: &str =
+    "Prikazuje spot u aplikaciji, uporedo sa muzikom (dupli klik na video = ceo ekran, Esc za izlaz).";
+pub const VIDEO_FULL_HINT: &str = "Dupli klik = ceo ekran";
+pub const EXIT_FULLSCREEN: &str = "Izađi iz celog ekrana (Esc)";
+pub const ON: &str = "Uključeno";
+pub const OFF: &str = "Isključeno";
+
 /// "1 pesma", "3 pesme", "7 pesama".
 pub fn songs(n: usize) -> String {
     let word = if n % 10 == 1 && n % 100 != 11 {

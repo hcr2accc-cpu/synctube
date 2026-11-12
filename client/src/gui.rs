@@ -8,7 +8,7 @@ use eframe::egui::{
     self, pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Event, FontId, Frame, Id,
     Key, LayerId, Layout, Margin, Order, Rect, RichText, Sense, Stroke, StrokeKind, UiBuilder,
 };
-use shared::{PlayStatus, RoomState};
+use shared::{MemberSync, PlayStatus, RoomState};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -31,6 +31,12 @@ const SIDEBAR_W: f32 = 236.0;
 /// Keep showing a seek target until the player catches up (avoids the
 /// progress bar jumping back for a moment).
 const SEEK_HOLD: Duration = Duration::from_millis(1500);
+/// Height of the full-screen video controls.
+const FULL_BAR_H: f32 = 56.0;
+/// Full-screen controls hide after this long without mouse movement.
+const CONTROLS_HIDE: Duration = Duration::from_millis(2500);
+/// The accent takes this long (seconds) to move to a new song's colour.
+const ACCENT_FADE: f32 = 0.6;
 
 enum Screen {
     Deps(deps::Shared),
@@ -76,6 +82,27 @@ pub struct App {
     seek_hold: Option<(u64, Instant)>,
     bar_width: f32,
     notify: Arc<dyn Fn() + Send + Sync>,
+    /// Search finds playlists instead of songs.
+    search_playlists: bool,
+    settings_open: bool,
+    /// Last `View::video_closed` seen.
+    video_closed_seen: u64,
+    /// Native area inside the window that mpv draws the video into.
+    video_host: Option<crate::video_host::VideoHost>,
+    /// Where the video goes this frame (set while laying out).
+    video_rect: Option<Rect>,
+    /// Video fills the whole (full-screen) window.
+    video_full: bool,
+    /// Bottom part of the video covered by the full-screen controls.
+    video_cut: f32,
+    /// Last mouse/key activity in full screen (shows the controls).
+    controls_at: Instant,
+    /// Pointer position last frame in full screen.
+    full_pointer: Option<egui::Pos2>,
+    /// The accent fades from one song's colour to the next.
+    accent_from: Color32,
+    accent_to: Color32,
+    accent_at: Instant,
 }
 
 impl App {
@@ -86,6 +113,7 @@ impl App {
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
         let config = Config::load();
         let tools = Tools::discover();
+        let video_host = crate::video_host::VideoHost::new(cc);
         let screen = if !fake_audio && deps::needed(&tools) {
             Screen::Deps(deps::start(tools.clone(), notify.clone()))
         } else {
@@ -99,12 +127,27 @@ impl App {
                 volume: config.volume,
                 normalize: config.normalize,
                 auto_update: true,
+                eq: config.eq.clone().clamped(),
+                video: config.video,
+                video_wid: video_host.as_ref().map(|h| h.wid()),
             },
             notify.clone(),
         );
         Self {
             engine: Some(engine),
             volume: config.volume,
+            search_playlists: config.search_playlists,
+            settings_open: false,
+            video_closed_seen: 0,
+            video_host,
+            video_rect: None,
+            video_full: false,
+            video_cut: 0.0,
+            controls_at: Instant::now(),
+            full_pointer: None,
+            accent_from: theme::ACCENT,
+            accent_to: theme::ACCENT,
+            accent_at: Instant::now(),
             config,
             screen,
             connecting: false,
@@ -134,6 +177,42 @@ impl App {
 
     fn view(&self) -> View {
         self.engine.as_ref().map(|e| e.view()).unwrap_or_default()
+    }
+
+    /// Moves the accent toward the colour of the playing song's thumbnail
+    /// (the brand accent when nothing plays or the picture is grey).
+    fn update_accent(&mut self, ctx: &egui::Context, view: &View) {
+        let track = match self.screen {
+            Screen::Room => view.room.as_ref().and_then(|r| r.current_track()),
+            _ => None,
+        };
+        let target = match track {
+            None => Some(theme::ACCENT),
+            // While the picture loads, keep the colour we have instead of
+            // flashing back to the brand accent between songs.
+            Some(t) => self
+                .thumbs
+                .tint(&t.youtube_id)
+                .map(|tint| tint.map_or(theme::ACCENT, theme::accent_from)),
+        };
+        let shown = theme::accent();
+        if let Some(target) = target {
+            if target != self.accent_to {
+                self.accent_from = shown;
+                self.accent_to = target;
+                self.accent_at = Instant::now();
+            }
+        }
+        let t = (self.accent_at.elapsed().as_secs_f32() / ACCENT_FADE).min(1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        let c = theme::mix(self.accent_from, self.accent_to, eased);
+        if c != shown {
+            theme::set_accent(c);
+            ctx.style_mut_of(egui::Theme::Dark, |s| theme::apply_accent(&mut s.visuals));
+        }
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
     }
 
     fn set_volume(&mut self, v: f64) {
@@ -187,7 +266,7 @@ impl App {
                                     icons::label(ui, Icon::Check, 14.0, theme::GOOD);
                                 }
                                 DepPhase::Extracting | DepPhase::Verifying => {
-                                    ui.add(egui::Spinner::new().size(13.0).color(theme::ACCENT));
+                                    ui.add(egui::Spinner::new().size(13.0).color(theme::accent()));
                                 }
                                 _ => {}
                             }
@@ -204,7 +283,7 @@ impl App {
                     let color = match &item.phase {
                         DepPhase::Done => theme::GOOD,
                         DepPhase::Failed(_) => theme::BAD,
-                        _ => theme::ACCENT,
+                        _ => theme::accent(),
                     };
                     thin_bar(ui, frac, color);
                     ui.add_space(6.0);
@@ -301,7 +380,7 @@ impl App {
                 ui.add_space(10.0);
                 if self.connecting {
                     ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(16.0).color(theme::ACCENT));
+                        ui.add(egui::Spinner::new().size(16.0).color(theme::accent()));
                         let text = match &view.conn {
                             ConnState::Connecting { waking: true } => s::WAKING_SERVER.to_string(),
                             ConnState::Reconnecting { retry_in_s } => {
@@ -402,13 +481,26 @@ impl App {
             // Joined but no state yet (or reconnecting from scratch).
             background_panel().show(ui, |ui| {
                 ui.centered_and_justified(|ui| {
-                    ui.add(egui::Spinner::new().size(28.0).color(theme::ACCENT));
+                    ui.add(egui::Spinner::new().size(28.0).color(theme::accent()));
                 });
             });
             return;
         };
 
         self.global_keys(ui, &room);
+
+        let show_video = self.config.video && room.current_track().is_some();
+        if self.video_full {
+            let leave = !show_video || ui.input(|i| i.key_pressed(Key::Escape));
+            if leave {
+                self.set_video_full(ui.ctx(), false);
+            } else {
+                egui::CentralPanel::default()
+                    .frame(Frame::new().fill(Color32::BLACK))
+                    .show(ui, |ui| self.video_full_ui(ui, view, &room));
+                return;
+            }
+        }
 
         let cur_id = room.current_track().map(|t| t.id);
         if cur_id != self.last_current {
@@ -451,7 +543,15 @@ impl App {
                         {
                             self.send(Command::Leave);
                             self.search_open = false;
+                            self.settings_open = false;
                             self.screen = Screen::Connect;
+                        }
+                        ui.add_space(2.0);
+                        if icons::ghost(ui, Icon::Gear, 30.0, true)
+                            .on_hover_text(s::SETTINGS)
+                            .clicked()
+                        {
+                            self.settings_open = !self.settings_open;
                         }
                         connection_pill(ui, view);
                     });
@@ -480,6 +580,10 @@ impl App {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::BG).inner_margin(Margin::same(16)))
             .show(ui, |ui| {
+                if show_video {
+                    self.video_ui(ui);
+                    ui.add_space(14.0);
+                }
                 self.now_playing_ui(ui, view, &room);
                 ui.add_space(14.0);
                 if self.search_open {
@@ -488,6 +592,120 @@ impl App {
                     self.queue_ui(ui, view, &room);
                 }
             });
+    }
+
+    /// The video of the song, inside the room screen (16:9, at most half
+    /// the height so the queue stays usable).
+    fn video_ui(&mut self, ui: &mut egui::Ui) {
+        let w = ui.available_width();
+        let h = (w * 9.0 / 16.0).min(ui.available_height() * 0.5).max(120.0);
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+        ui.painter().rect(
+            rect,
+            12.0,
+            theme::CARD,
+            Stroke::new(1.0, theme::BORDER),
+            StrokeKind::Inside,
+        );
+        let inner = rect.shrink(6.0);
+        ui.painter().rect_filled(inner, 6.0, Color32::BLACK);
+        if resp.double_clicked() {
+            self.set_video_full(ui.ctx(), true);
+        }
+        resp.on_hover_text(s::VIDEO_FULL_HINT);
+        self.video_rect = Some(inner);
+    }
+
+    /// Full-screen video with controls that show on mouse movement and
+    /// hide while watching.
+    fn video_full_ui(&mut self, ui: &mut egui::Ui, view: &View, room: &RoomState) {
+        let rect = ui.max_rect();
+        self.video_rect = Some(rect);
+        // Real mouse movement, a click, scroll or a key shows the controls.
+        let (pos, active) = ui.input(|i| {
+            let pressed = i.pointer.any_pressed()
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, Event::MouseWheel { .. }))
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, Event::Key { pressed: true, .. }));
+            (i.pointer.latest_pos(), pressed)
+        });
+        let moved = match (pos, self.full_pointer) {
+            (Some(p), Some(last)) => p.distance(last) > 1.0,
+            _ => false,
+        };
+        self.full_pointer = pos;
+        if active || moved {
+            self.controls_at = Instant::now();
+        }
+        let idle = self.controls_at.elapsed();
+        let dragging = self.seek_drag.is_some() || ui.ctx().dragged_id().is_some();
+        let resp = ui.interact(rect, Id::unique("video_full"), Sense::click());
+        if resp.double_clicked() {
+            self.set_video_full(ui.ctx(), false);
+        }
+        if idle >= CONTROLS_HIDE && !dragging {
+            ui.ctx().set_cursor_icon(CursorIcon::None);
+            return;
+        }
+        ui.ctx()
+            .request_repaint_after(CONTROLS_HIDE.saturating_sub(idle) + Duration::from_millis(30));
+        self.video_cut = FULL_BAR_H;
+        let bar = Rect::from_min_max(pos2(rect.left(), rect.bottom() - FULL_BAR_H), rect.max);
+        ui.painter()
+            .rect_filled(bar, 0.0, Color32::from_rgb(14, 14, 18));
+
+        let track = room.current_track().cloned();
+        let mut ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt("video_full_controls")
+                .max_rect(bar.shrink2(vec2(18.0, 2.0)))
+                .layout(Layout::top_down(Align::Min)),
+        );
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let (shown, duration) = self.seek_bar(&mut ui, view, track.as_ref(), false);
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            self.playback_buttons(ui, room, track.is_some(), true);
+            ui.add_space(8.0);
+            self.mute_button(ui);
+            ui.spacing_mut().slider_width = 80.0;
+            self.volume_slider(ui);
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} / {}",
+                    fmt_time(shown),
+                    duration.map_or("--:--".into(), fmt_time)
+                ))
+                .size(12.5)
+                .color(theme::TEXT_DIM),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icons::ghost(ui, Icon::ExitFullscreen, 26.0, true)
+                    .on_hover_text(s::EXIT_FULLSCREEN)
+                    .clicked()
+                {
+                    self.set_video_full(ui.ctx(), false);
+                }
+                if let Some(t) = &track {
+                    ui.add(
+                        egui::Label::new(RichText::new(&t.title).size(12.5).color(theme::TEXT))
+                            .truncate(),
+                    );
+                }
+            });
+        });
+    }
+
+    fn set_video_full(&mut self, ctx: &egui::Context, on: bool) {
+        if self.video_full != on {
+            self.video_full = on;
+            self.controls_at = Instant::now();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        }
     }
 
     /// Ctrl+V anywhere adds a link; Space toggles playback.
@@ -561,7 +779,10 @@ impl App {
             let text = self.link.trim().to_string();
             if is_search(&text) {
                 // The query stays in the field, so it can be refined.
-                self.send(Command::Search(text));
+                self.send(Command::Search {
+                    query: text,
+                    playlists: self.search_playlists,
+                });
                 self.search_open = true;
                 self.search_added.clear();
             } else {
@@ -577,22 +798,39 @@ impl App {
     fn search_ui(&mut self, ui: &mut egui::Ui, view: &View, room: &RoomState) {
         let search = &view.search;
         let mut close = false;
+        let mut mode = None;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(s::SEARCH_TITLE)
                     .font(bold_font(15.5))
                     .color(theme::TEXT),
             );
+            ui.add_space(4.0);
+            for (playlists, text) in [(false, s::SEARCH_SONGS), (true, s::SEARCH_PLAYLISTS)] {
+                if toggle_pill(ui, text, self.search_playlists == playlists).clicked()
+                    && self.search_playlists != playlists
+                {
+                    mode = Some(playlists);
+                }
+            }
             if !search.query.is_empty() {
-                ui.label(
-                    RichText::new(format!("· {}", search.query))
-                        .size(13.0)
-                        .color(theme::TEXT_DIM),
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("· {}", search.query))
+                            .size(13.0)
+                            .color(theme::TEXT_DIM),
+                    )
+                    .truncate(),
                 );
             }
-            if !search.results.is_empty() {
+            if !search.results.is_empty() && ui.available_width() > 360.0 {
+                let hint = if search.playlists {
+                    s::SEARCH_HINT_PLAYLISTS
+                } else {
+                    s::SEARCH_HINT
+                };
                 ui.label(
-                    RichText::new(format!("· {}", s::SEARCH_HINT))
+                    RichText::new(format!("· {hint}"))
                         .size(12.0)
                         .color(theme::TEXT_FAINT),
                 );
@@ -607,12 +845,25 @@ impl App {
             });
         });
         ui.add_space(4.0);
-        let escape =
-            !ui.ctx().egui_wants_keyboard_input() && ui.input(|i| i.key_pressed(Key::Escape));
+        let escape = !self.settings_open
+            && !ui.ctx().egui_wants_keyboard_input()
+            && ui.input(|i| i.key_pressed(Key::Escape));
         if close || escape {
             self.search_open = false;
             self.send(Command::ClearSearch);
             return;
+        }
+        if let Some(playlists) = mode {
+            self.search_playlists = playlists;
+            self.config.search_playlists = playlists;
+            self.config.save();
+            if !search.query.is_empty() {
+                self.send(Command::Search {
+                    query: search.query.clone(),
+                    playlists,
+                });
+                return;
+            }
         }
         if let Some(e) = &search.error {
             empty_state(ui, e, "");
@@ -621,7 +872,7 @@ impl App {
         if search.loading || search.results.is_empty() {
             ui.add_space(48.0);
             ui.vertical_centered(|ui| {
-                ui.add(egui::Spinner::new().size(26.0).color(theme::ACCENT));
+                ui.add(egui::Spinner::new().size(26.0).color(theme::accent()));
                 ui.add_space(10.0);
                 ui.label(
                     RichText::new(s::SEARCHING)
@@ -637,7 +888,7 @@ impl App {
         ui.spacing_mut().item_spacing.y = ROW_GAP;
         egui::ScrollArea::vertical()
             // A new search starts scrolled to the top.
-            .id_salt(("search_scroll", &search.query))
+            .id_salt(("search_scroll", &search.query, search.playlists))
             .auto_shrink([false, false])
             .show_rows(ui, ROW_H, hits.len(), |ui, range| {
                 for hit in &hits[range] {
@@ -659,7 +910,16 @@ impl App {
             pos2(rect.left() + 8.0, rect.center().y - 18.0),
             vec2(64.0, 36.0),
         );
-        let tex = self.thumbs.get(&hit.youtube_id);
+        let tex = hit.thumb_id.as_deref().and_then(|id| self.thumbs.get(id));
+        if hit.playlist {
+            // Two cards peeking out behind the cover: a stack of songs.
+            for (k, a) in [(2.0, 60), (1.0, 120)] {
+                let r = thumb
+                    .translate(vec2(0.0, -3.0 * k))
+                    .shrink2(vec2(4.0 * k, 0.0));
+                p.rect_filled(r, 4.0, theme::accent_alpha(a));
+            }
+        }
         paint_thumb(ui, thumb, tex, 5);
 
         let btn =
@@ -671,20 +931,24 @@ impl App {
         );
         let add = if added {
             p.circle_filled(btn.center(), 15.0, theme::accent_alpha(36));
-            icons::paint(&p, Icon::Check, btn.shrink(9.0), theme::ACCENT);
+            icons::paint(&p, Icon::Check, btn.shrink(9.0), theme::accent());
             btn_resp.on_hover_text(s::IN_QUEUE);
             false
         } else {
             let fill = if btn_resp.hovered() {
-                theme::ACCENT_HOVER
+                theme::accent_hover()
             } else {
-                theme::ACCENT
+                theme::accent()
             };
             p.circle_filled(btn.center(), 15.0, fill);
-            icons::paint(&p, Icon::Plus, btn.shrink(9.5), Color32::WHITE);
+            icons::paint(&p, Icon::Plus, btn.shrink(9.5), theme::ON_ACCENT);
             let btn_resp = btn_resp
                 .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text(s::ADD_TO_QUEUE);
+                .on_hover_text(if hit.playlist {
+                    s::ADD_PLAYLIST
+                } else {
+                    s::ADD_TO_QUEUE
+                });
             btn_resp.clicked() || resp.double_clicked()
         };
 
@@ -701,7 +965,25 @@ impl App {
             let ch = one_line(ui, ch, font(12.0), theme::TEXT_DIM, max_w);
             p.galley(pos2(text_left, rect.center().y + 2.0), ch, theme::TEXT_DIM);
         }
-        if let Some(d) = hit.duration_ms {
+        if hit.playlist {
+            let g = p.layout_no_wrap(
+                s::PLAYLIST_TAG.to_uppercase(),
+                bold_font(10.5),
+                theme::accent_hover(),
+            );
+            let r = Rect::from_min_size(
+                pos2(dur_right - g.size().x - 14.0, rect.center().y - 10.0),
+                vec2(g.size().x + 14.0, 20.0),
+            );
+            p.rect(
+                r,
+                10.0,
+                theme::accent_alpha(28),
+                Stroke::new(1.0, theme::accent_alpha(90)),
+                StrokeKind::Inside,
+            );
+            p.galley(r.center() - g.size() / 2.0, g, theme::accent_hover());
+        } else if let Some(d) = hit.duration_ms {
             p.text(
                 pos2(dur_right, rect.center().y),
                 Align2::RIGHT_CENTER,
@@ -711,14 +993,18 @@ impl App {
             );
         }
         if add {
-            self.send(Command::Add(shared::youtube::watch_url(&hit.youtube_id)));
+            self.send(Command::Add(hit.url()));
             self.search_added.insert(hit.youtube_id.clone());
         }
     }
 
     fn now_playing_ui(&mut self, ui: &mut egui::Ui, view: &View, room: &RoomState) {
         let track = room.current_track().cloned();
-        card_frame().show(ui, |ui| {
+        // Filled in once the card's size is known: above its fill, below
+        // its content.
+        let mut wash = None;
+        let card = card_frame().show(ui, |ui| {
+            wash = Some(ui.painter().add(egui::Shape::Noop));
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(144.0, 81.0), Sense::hover());
@@ -734,7 +1020,7 @@ impl App {
                             ui.painter(),
                             Icon::Note,
                             Rect::from_center_size(c, vec2(30.0, 30.0)),
-                            theme::ACCENT,
+                            theme::accent(),
                         );
                     }
                 }
@@ -745,7 +1031,7 @@ impl App {
                     ui.label(
                         RichText::new(s::NOW_PLAYING.to_uppercase())
                             .font(bold_font(11.0))
-                            .color(theme::ACCENT),
+                            .color(theme::accent()),
                     );
                     match &track {
                         Some(t) => {
@@ -806,9 +1092,36 @@ impl App {
                 error_box(ui, &format!("{e} {}", s::MISSING_TOOLS_PLAYBACK));
             }
         });
+        if let (Some(idx), true) = (wash, track.is_some()) {
+            ui.painter()
+                .set(idx, accent_wash(card.response.rect.shrink(1.0), 11));
+        }
     }
 
     fn progress_ui(&mut self, ui: &mut egui::Ui, view: &View, track: Option<&shared::Track>) {
+        let (shown, duration) = self.seek_bar(ui, view, track, true);
+        ui.add_space(-6.0);
+        ui.horizontal(|ui| {
+            let small = |t: String| RichText::new(t).size(12.0).color(theme::TEXT_DIM);
+            ui.label(small(if track.is_some() {
+                fmt_time(shown)
+            } else {
+                "0:00".into()
+            }));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(small(duration.map_or("--:--".into(), fmt_time)));
+            });
+        });
+    }
+
+    /// The seek bar; returns the position shown and the song length.
+    fn seek_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        view: &View,
+        track: Option<&shared::Track>,
+        bubble: bool,
+    ) -> (u64, Option<u64>) {
         let duration = track.and_then(|t| t.duration_ms).filter(|d| *d > 0);
         let mut pos = view.position_ms().unwrap_or(0);
         if let Some((target, at)) = self.seek_hold {
@@ -853,11 +1166,11 @@ impl App {
         p.rect_filled(bar, h / 2.0, theme::BORDER);
         let done = Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac, bar.bottom()));
         if done.width() > 0.5 {
-            p.rect_filled(done, h / 2.0, theme::ACCENT);
+            p.rect_filled(done, h / 2.0, theme::accent());
         }
         if active {
             p.circle_filled(pos2(done.right(), bar.center().y), 7.0, Color32::WHITE);
-            if let (Some(f), Some(d)) = (pointer_frac, duration) {
+            if let (true, Some(f), Some(d)) = (bubble, pointer_frac, duration) {
                 let text = fmt_time((f as f64 * d as f64) as u64);
                 let g = p.layout_no_wrap(text, font(12.0), theme::TEXT);
                 let x = (rect.left() + rect.width() * f).clamp(
@@ -877,89 +1190,17 @@ impl App {
             }
             resp.on_hover_cursor(egui::CursorIcon::PointingHand);
         }
-        ui.add_space(-6.0);
-        ui.horizontal(|ui| {
-            let small = |t: String| RichText::new(t).size(12.0).color(theme::TEXT_DIM);
-            ui.label(small(if track.is_some() {
-                fmt_time(shown)
-            } else {
-                "0:00".into()
-            }));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(small(duration.map_or("--:--".into(), fmt_time)));
-            });
-        });
+        (shown, duration)
     }
 
     fn transport_ui(&mut self, ui: &mut egui::Ui, room: &RoomState, has_track: bool) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if icons::ghost(ui, Icon::Previous, 36.0, has_track)
-                .on_hover_text(s::PREVIOUS)
-                .clicked()
-            {
-                self.send(Command::Previous);
-            }
-            let playing = room.playback.status == PlayStatus::Playing || room.waiting_for_ready;
-            let (icon, tip) = if playing {
-                (Icon::Pause, s::PAUSE)
-            } else {
-                (Icon::Play, s::PLAY)
-            };
-            if icons::round(ui, icon, 46.0, has_track || !room.queue.is_empty())
-                .on_hover_text(tip)
-                .clicked()
-            {
-                self.send(Command::TogglePlay);
-            }
-            if icons::ghost(ui, Icon::Next, 36.0, has_track)
-                .on_hover_text(s::NEXT)
-                .clicked()
-            {
-                self.send(Command::Next);
-            }
+            self.playback_buttons(ui, room, has_track, false);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                ui.add_sized(
-                    [36.0, 20.0],
-                    egui::Label::new(
-                        RichText::new(format!("{:.0}%", self.volume))
-                            .size(12.5)
-                            .color(theme::TEXT_DIM),
-                    ),
-                );
                 ui.spacing_mut().slider_width = 110.0;
-                let r = ui.add(
-                    egui::Slider::new(&mut self.volume, 0.0..=100.0)
-                        .show_value(false)
-                        .step_by(1.0),
-                );
-                if r.changed() {
-                    self.muted_from = None;
-                    self.send(Command::SetVolume(self.volume));
-                }
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                    self.config.volume = self.volume;
-                    self.config.save();
-                }
-                let muted = self.volume <= 0.0;
-                let (icon, tip) = if muted {
-                    (Icon::Mute, s::UNMUTE)
-                } else {
-                    (Icon::Volume, s::MUTE)
-                };
-                if icons::ghost(ui, icon, 30.0, true)
-                    .on_hover_text(tip)
-                    .clicked()
-                {
-                    if muted {
-                        let v = self.muted_from.take().unwrap_or(50.0);
-                        self.set_volume(v);
-                    } else {
-                        self.muted_from = Some(self.volume);
-                        self.set_volume(0.0);
-                    }
-                }
+                self.volume_ui(ui);
                 ui.add_space(6.0);
                 let on = self.config.normalize;
                 if toggle_pill(ui, s::NORMALIZE, on)
@@ -976,6 +1217,102 @@ impl App {
                 }
             });
         });
+    }
+
+    /// Previous, play/pause, next.
+    fn playback_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        room: &RoomState,
+        has_track: bool,
+        compact: bool,
+    ) {
+        let (side, main) = if compact { (28.0, 32.0) } else { (36.0, 46.0) };
+        if icons::ghost(ui, Icon::Previous, side, has_track)
+            .on_hover_text(s::PREVIOUS)
+            .clicked()
+        {
+            self.send(Command::Previous);
+        }
+        let playing = room.playback.status == PlayStatus::Playing || room.waiting_for_ready;
+        let (icon, tip) = if playing {
+            (Icon::Pause, s::PAUSE)
+        } else {
+            (Icon::Play, s::PLAY)
+        };
+        if icons::round(ui, icon, main, has_track || !room.queue.is_empty())
+            .on_hover_text(tip)
+            .clicked()
+        {
+            self.send(Command::TogglePlay);
+        }
+        if icons::ghost(ui, Icon::Next, side, has_track)
+            .on_hover_text(s::NEXT)
+            .clicked()
+        {
+            self.send(Command::Next);
+        }
+    }
+
+    /// Mute button, volume slider and percentage (in the layout's direction).
+    fn volume_ui(&mut self, ui: &mut egui::Ui) {
+        if ui.layout().prefer_right_to_left() {
+            self.volume_label(ui);
+            self.volume_slider(ui);
+            self.mute_button(ui);
+        } else {
+            self.mute_button(ui);
+            self.volume_slider(ui);
+            self.volume_label(ui);
+        }
+    }
+
+    fn volume_label(&self, ui: &mut egui::Ui) {
+        ui.add_sized(
+            [36.0, 20.0],
+            egui::Label::new(
+                RichText::new(format!("{:.0}%", self.volume))
+                    .size(12.5)
+                    .color(theme::TEXT_DIM),
+            ),
+        );
+    }
+
+    fn volume_slider(&mut self, ui: &mut egui::Ui) {
+        let r = ui.add(
+            egui::Slider::new(&mut self.volume, 0.0..=100.0)
+                .show_value(false)
+                .step_by(1.0),
+        );
+        if r.changed() {
+            self.muted_from = None;
+            self.send(Command::SetVolume(self.volume));
+        }
+        if r.drag_stopped() || (r.changed() && !r.dragged()) {
+            self.config.volume = self.volume;
+            self.config.save();
+        }
+    }
+
+    fn mute_button(&mut self, ui: &mut egui::Ui) {
+        let muted = self.volume <= 0.0;
+        let (icon, tip) = if muted {
+            (Icon::Mute, s::UNMUTE)
+        } else {
+            (Icon::Volume, s::MUTE)
+        };
+        if icons::ghost(ui, icon, 30.0, true)
+            .on_hover_text(tip)
+            .clicked()
+        {
+            if muted {
+                let v = self.muted_from.take().unwrap_or(50.0);
+                self.set_volume(v);
+            } else {
+                self.muted_from = Some(self.volume);
+                self.set_volume(0.0);
+            }
+        }
     }
 
     fn queue_ui(&mut self, ui: &mut egui::Ui, view: &View, room: &RoomState) {
@@ -1128,9 +1465,9 @@ impl App {
             let p = ui.painter();
             p.line_segment(
                 [pos2(left + 8.0, y), pos2(right - 4.0, y)],
-                Stroke::new(2.0, theme::ACCENT),
+                Stroke::new(2.0, theme::accent()),
             );
-            p.circle_filled(pos2(left + 8.0, y), 4.0, theme::ACCENT);
+            p.circle_filled(pos2(left + 8.0, y), 4.0, theme::accent());
         }
 
         // The row follows the pointer above everything else.
@@ -1144,7 +1481,7 @@ impl App {
             rect,
             8.0,
             theme::CARD_HOVER,
-            Stroke::new(1.0, theme::ACCENT),
+            Stroke::new(1.0, theme::accent()),
             StrokeKind::Inside,
         );
         let thumb =
@@ -1224,7 +1561,7 @@ impl App {
             p.rect_filled(
                 Rect::from_min_size(rect.min + vec2(0.0, 12.0), vec2(3.0, ROW_H - 24.0)),
                 2.0,
-                theme::ACCENT,
+                theme::accent(),
             );
         } else if hovered {
             p.rect_filled(rect, 8.0, theme::CARD);
@@ -1401,7 +1738,7 @@ impl App {
                     animating |= alpha < 1.0;
                     ui.scope(|ui| {
                         ui.multiply_opacity(alpha);
-                        let color = if t.error { theme::BAD } else { theme::ACCENT };
+                        let color = if t.error { theme::BAD } else { theme::accent() };
                         Frame::new()
                             .fill(theme::CARD)
                             .stroke(Stroke::new(1.0, theme::BORDER))
@@ -1549,10 +1886,353 @@ fn recent_row(ui: &mut egui::Ui, i: usize, r: &crate::config::RecentRoom) -> Opt
     }
 }
 
+// ----- settings ----------------------------------------------------------------------
+
+const EQ_FREQ_LABELS: [&str; crate::eq::BANDS] = [
+    "32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k",
+];
+
+impl App {
+    /// The settings window (equalizer and video mode), over the room screen.
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        let w = (screen.width() - 32.0).clamp(260.0, 620.0);
+        let margin = if w < 400.0 { 14 } else { 22 };
+        let mut close = false;
+        let resp = egui::Modal::new(Id::unique("settings_modal"))
+            .backdrop_color(Color32::from_black_alpha(150))
+            .frame(
+                card_frame()
+                    .inner_margin(Margin::same(margin))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                let inner_w = w - 2.0 * margin as f32 - 2.0;
+                ui.set_width(inner_w);
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                    icons::paint(ui.painter(), Icon::Gear, r.shrink(2.0), theme::accent());
+                    ui.label(
+                        RichText::new(s::SETTINGS)
+                            .font(bold_font(18.0))
+                            .color(theme::TEXT),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icons::ghost(ui, Icon::Remove, 28.0, true)
+                            .on_hover_text(s::CLOSE)
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .max_height((screen.height() - 120.0).max(200.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.set_width(inner_w);
+                        section_label(ui, s::EQ_TITLE);
+                        ui.add_space(6.0);
+                        self.eq_ui(ui);
+                        ui.add_space(18.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        section_label(ui, s::VIDEO_TITLE);
+                        ui.add_space(6.0);
+                        let on = self.config.video;
+                        if toggle_pill(ui, if on { s::ON } else { s::OFF }, on).clicked() {
+                            self.config.video = !on;
+                            self.config.save();
+                            self.send(Command::SetVideo(!on));
+                        }
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(s::VIDEO_EXPLAIN)
+                                    .size(12.5)
+                                    .color(theme::TEXT_DIM),
+                            )
+                            .wrap(),
+                        );
+                    });
+            });
+        if close || resp.should_close() {
+            self.settings_open = false;
+            self.config.save();
+        }
+    }
+
+    fn eq_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::eq::{BANDS, MAX_DB, PRESETS};
+        let mut eq = self.config.eq.clone();
+        let mut changed = false;
+        let mut save = false;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            if toggle_pill(ui, if eq.enabled { s::ON } else { s::OFF }, eq.enabled).clicked() {
+                eq.enabled = !eq.enabled;
+                changed = true;
+                save = true;
+            }
+            ui.add_space(4.0);
+            let current = eq.preset();
+            for (i, (name, gains)) in PRESETS.iter().enumerate() {
+                if chip(ui, name, eq.enabled && current == Some(i)).clicked() {
+                    eq.gains = *gains;
+                    eq.enabled = true;
+                    changed = true;
+                    save = true;
+                }
+            }
+            if current.is_none() {
+                chip(ui, s::EQ_CUSTOM, eq.enabled);
+            }
+        });
+        ui.add_space(10.0);
+
+        // The graph: one vertical slider per band, like a hardware EQ.
+        let narrow = ui.available_width() < 420.0;
+        let label_w = if narrow { 30.0 } else { 46.0 };
+        let plot_h = if narrow { 170.0 } else { 200.0 };
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(ui.available_width(), plot_h + 40.0), Sense::hover());
+        let plot = Rect::from_min_max(
+            pos2(rect.left() + label_w, rect.top() + 14.0),
+            pos2(rect.right() - 6.0, rect.top() + 14.0 + plot_h),
+        );
+        let half = plot.height() / 2.0;
+        let y_of = |db: f64| plot.center().y - (db / MAX_DB) as f32 * half;
+        let db_of = |y: f32| ((plot.center().y - y) / half) as f64 * MAX_DB;
+        let col_w = plot.width() / BANDS as f32;
+        let on = eq.enabled;
+        let accent = if on {
+            theme::accent()
+        } else {
+            theme::TEXT_FAINT
+        };
+
+        let p = ui.painter().clone();
+        p.rect_filled(rect, 10.0, theme::FIELD);
+        for (db, label) in [
+            (12.0, "+12 dB"),
+            (6.0, "+6"),
+            (0.0, "0 dB"),
+            (-6.0, "−6"),
+            (-12.0, "−12 dB"),
+        ] {
+            let y = y_of(db);
+            let stroke = if db == 0.0 {
+                Stroke::new(1.0, theme::BORDER)
+            } else {
+                Stroke::new(1.0, theme::BORDER.gamma_multiply(0.45))
+            };
+            p.line_segment([pos2(plot.left() - 4.0, y), pos2(plot.right(), y)], stroke);
+            let text = if narrow {
+                label.trim_end_matches(" dB")
+            } else {
+                label
+            };
+            p.text(
+                pos2(rect.left() + 8.0, y),
+                Align2::LEFT_CENTER,
+                text,
+                font(10.5),
+                theme::TEXT_FAINT,
+            );
+        }
+
+        let mut knobs = Vec::with_capacity(BANDS);
+        let mut active_band = None;
+        for (i, freq_label) in EQ_FREQ_LABELS.iter().enumerate() {
+            let x = plot.left() + col_w * (i as f32 + 0.5);
+            let hit =
+                Rect::from_center_size(pos2(x, plot.center().y), vec2(col_w, plot.height() + 28.0));
+            let resp = ui
+                .interact(
+                    hit,
+                    ui.scope_id().with(("eq_band", i)),
+                    Sense::click_and_drag(),
+                )
+                .on_hover_cursor(CursorIcon::ResizeVertical);
+            if resp.double_clicked() {
+                eq.gains[i] = 0.0;
+                changed = true;
+            } else if resp.is_pointer_button_down_on() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    // 0.5 dB steps: smooth enough, and few player updates.
+                    let v = (db_of(pos.y).clamp(-MAX_DB, MAX_DB) * 2.0).round() / 2.0;
+                    if (v - eq.gains[i]).abs() > 0.01 || !eq.enabled {
+                        eq.gains[i] = v;
+                        eq.enabled = true;
+                        changed = true;
+                    }
+                }
+            }
+            if resp.drag_stopped() || resp.clicked() || resp.double_clicked() {
+                save = true;
+            }
+            let hot = resp.hovered() || resp.is_pointer_button_down_on();
+            if hot {
+                active_band = Some(i);
+            }
+            let ky = y_of(eq.gains[i]);
+            p.line_segment(
+                [pos2(x, plot.top()), pos2(x, plot.bottom())],
+                Stroke::new(2.0, theme::BORDER),
+            );
+            p.line_segment(
+                [pos2(x, y_of(0.0)), pos2(x, ky)],
+                Stroke::new(3.0, accent.gamma_multiply(0.8)),
+            );
+            knobs.push((pos2(x, ky), hot));
+            p.text(
+                pos2(x, plot.bottom() + 16.0),
+                Align2::CENTER_CENTER,
+                *freq_label,
+                font(if narrow { 10.0 } else { 11.0 }),
+                if hot { theme::TEXT } else { theme::TEXT_DIM },
+            );
+        }
+        // A soft curve through the knobs, then the knobs on top.
+        let curve: Vec<_> = knobs.iter().map(|(k, _)| *k).collect();
+        p.add(egui::Shape::line(
+            curve,
+            Stroke::new(
+                1.5,
+                if on {
+                    theme::accent_alpha(110)
+                } else {
+                    theme::BORDER
+                },
+            ),
+        ));
+        let r = if narrow { 6.5 } else { 8.0 };
+        for (k, hot) in &knobs {
+            let rr = if *hot { r + 1.5 } else { r };
+            p.circle_filled(*k, rr + 3.0, theme::FIELD);
+            p.circle_filled(*k, rr, theme::CARD);
+            p.circle_stroke(*k, rr, Stroke::new(2.5, accent));
+            p.circle_filled(*k, rr * 0.38, accent);
+        }
+        if let Some(i) = active_band {
+            let (k, _) = knobs[i];
+            let text = format!("{:+.1} dB", eq.gains[i]);
+            let g = p.layout_no_wrap(text, bold_font(11.0), theme::ON_ACCENT);
+            let size = g.size() + vec2(12.0, 6.0);
+            let mut bubble = Rect::from_center_size(pos2(k.x, k.y - r - 16.0), size);
+            if bubble.top() < rect.top() + 2.0 {
+                bubble = bubble.translate(vec2(0.0, 2.0 * (r + 16.0)));
+            }
+            let bubble = bubble.translate(vec2(
+                (rect.left() + 2.0 - bubble.left()).max(0.0)
+                    - (bubble.right() - rect.right() + 2.0).max(0.0),
+                0.0,
+            ));
+            p.rect_filled(bubble, 6.0, theme::accent());
+            p.galley(bubble.min + vec2(6.0, 3.0), g, theme::ON_ACCENT);
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(s::EQ_HINT)
+                    .size(12.0)
+                    .color(theme::TEXT_FAINT),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        eq.gains.iter().any(|g| g.abs() > 0.01),
+                        egui::Button::new(s::EQ_RESET).min_size(vec2(0.0, 26.0)),
+                    )
+                    .clicked()
+                {
+                    eq.gains = [0.0; BANDS];
+                    changed = true;
+                    save = true;
+                }
+            });
+        });
+
+        if changed {
+            self.config.eq = eq.clone();
+            self.send(Command::SetEq(eq));
+        }
+        if save {
+            self.config.save();
+        }
+    }
+}
+
+/// A rounded choice chip (accent when selected).
+fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let color = if selected {
+        theme::ON_ACCENT
+    } else {
+        theme::TEXT_DIM
+    };
+    let g = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font(12.5), color);
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 22.0, 26.0), Sense::click());
+    let (fill, stroke) = if selected {
+        (theme::accent(), theme::accent())
+    } else if resp.hovered() {
+        (theme::CARD_HOVER, theme::BORDER)
+    } else {
+        (Color32::TRANSPARENT, theme::BORDER)
+    };
+    let p = ui.painter();
+    p.rect(
+        rect,
+        13.0,
+        fill,
+        Stroke::new(1.0, stroke),
+        StrokeKind::Inside,
+    );
+    p.galley(
+        pos2(
+            rect.center().x - g.size().x / 2.0,
+            rect.center().y - g.size().y / 2.0,
+        ),
+        g,
+        color,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 // ----- shared widgets ----------------------------------------------------------------
 
 fn background_panel() -> egui::CentralPanel {
     egui::CentralPanel::default().frame(Frame::new().fill(theme::BG).inner_margin(Margin::same(16)))
+}
+
+/// The song's colour as a soft wash over the left part of a card.
+fn accent_wash(rect: Rect, radius: u8) -> egui::Shape {
+    let strong = theme::accent_alpha(34);
+    let split = rect.left() + radius as f32;
+    let end = rect.left() + rect.width() * 0.72;
+    // The rounded left edge, then a fade to nothing.
+    let cap = egui::Shape::rect_filled(
+        Rect::from_min_max(rect.min, pos2(split, rect.bottom())),
+        CornerRadius {
+            nw: radius,
+            sw: radius,
+            ne: 0,
+            se: 0,
+        },
+        strong,
+    );
+    let mut fade = egui::Mesh::default();
+    fade.colored_vertex(pos2(split, rect.top()), strong);
+    fade.colored_vertex(pos2(end, rect.top()), Color32::TRANSPARENT);
+    fade.colored_vertex(pos2(end, rect.bottom()), Color32::TRANSPARENT);
+    fade.colored_vertex(pos2(split, rect.bottom()), strong);
+    fade.add_triangle(0, 1, 2);
+    fade.add_triangle(0, 2, 3);
+    egui::Shape::Vec(vec![cap, egui::Shape::mesh(fade)])
 }
 
 fn card_frame() -> Frame {
@@ -1661,14 +2341,14 @@ fn primary_button(
     let fill = if !enabled {
         theme::CARD_HOVER
     } else if resp.is_pointer_button_down_on() {
-        theme::ACCENT
+        theme::accent()
     } else if resp.hovered() {
-        theme::ACCENT_HOVER
+        theme::accent_hover()
     } else {
-        theme::ACCENT
+        theme::accent()
     };
     let color = if enabled {
-        Color32::WHITE
+        theme::ON_ACCENT
     } else {
         theme::TEXT_FAINT
     };
@@ -1730,7 +2410,7 @@ fn tag(
 /// A clickable on/off pill (accent when on).
 fn toggle_pill(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
     let color = if on {
-        theme::ACCENT_HOVER
+        theme::accent_hover()
     } else {
         theme::TEXT_DIM
     };
@@ -1742,7 +2422,7 @@ fn toggle_pill(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
     let (fill, stroke) = if on {
         (
             theme::accent_alpha(if hovered { 46 } else { 30 }),
-            theme::ACCENT,
+            theme::accent(),
         )
     } else if hovered {
         (theme::CARD_HOVER, theme::BORDER)
@@ -1759,7 +2439,7 @@ fn toggle_pill(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
     );
     let dot = pos2(rect.left() + 13.0, rect.center().y);
     if on {
-        p.circle_filled(dot, 3.5, theme::ACCENT);
+        p.circle_filled(dot, 3.5, theme::accent());
     } else {
         p.circle_stroke(dot, 3.0, Stroke::new(1.2, theme::TEXT_FAINT));
     }
@@ -1845,7 +2525,7 @@ fn paint_bars(p: &egui::Painter, c: egui::Pos2, playing: bool) {
     for (k, h) in heights.iter().enumerate() {
         let x = c.x - 6.0 + k as f32 * 5.0;
         let r = Rect::from_min_max(pos2(x - 1.5, c.y + 8.0 - h), pos2(x + 1.5, c.y + 8.0));
-        p.rect_filled(r, 1.0, theme::ACCENT);
+        p.rect_filled(r, 1.0, theme::accent());
     }
 }
 
@@ -1864,7 +2544,7 @@ fn pending_row(ui: &mut egui::Ui, add: &PendingAdd) {
     let num = Rect::from_min_size(rect.min, vec2(40.0, ROW_H));
     egui::Spinner::new()
         .size(16.0)
-        .color(theme::ACCENT)
+        .color(theme::accent())
         .paint_at(ui, Rect::from_center_size(num.center(), vec2(16.0, 16.0)));
     let thumb = Rect::from_min_size(pos2(num.right(), rect.center().y - 18.0), vec2(64.0, 36.0));
     p.rect_filled(
@@ -1885,8 +2565,8 @@ fn pending_row(ui: &mut egui::Ui, add: &PendingAdd) {
         g,
         color,
     );
-    let g = one_line(ui, s::ADDING, font(12.0), theme::ACCENT, max_w);
-    p.galley(pos2(text_left, rect.center().y + 2.0), g, theme::ACCENT);
+    let g = one_line(ui, s::ADDING, font(12.0), theme::accent(), max_w);
+    p.galley(pos2(text_left, rect.center().y + 2.0), g, theme::accent());
     ui.ctx().request_repaint();
 }
 
@@ -1902,7 +2582,7 @@ fn empty_state(ui: &mut egui::Ui, title: &str, hint: &str) {
         p,
         Icon::Note,
         Rect::from_center_size(c, vec2(24.0, 24.0)),
-        theme::ACCENT,
+        theme::accent(),
     );
     p.text(
         c + vec2(0.0, 42.0),
@@ -1947,13 +2627,114 @@ fn sidebar_ui(ui: &mut egui::Ui, view: &View) {
                     ui.spacing_mut().item_spacing.y = 6.0;
                     for m in &view.members {
                         let me = view.me.as_ref().is_some_and(|me| me.id == m.id);
-                        member_row(ui, &m.name, me);
+                        let sync = if me { Some(view.sync()) } else { m.sync };
+                        member_row(ui, &m.name, me, sync);
                     }
                 });
         });
 }
 
-fn member_row(ui: &mut egui::Ui, name: &str, me: bool) {
+/// Where a person's dot sits against the line (points; negative = above)
+/// and whether it is a ring (still loading).
+fn dot_place(sync: Option<MemberSync>) -> (f32, bool) {
+    match sync {
+        Some(s) if s.loading => (9.0, true),
+        Some(MemberSync {
+            drift_ms: Some(d), ..
+        }) if (d as i64).abs() > shared::sync::DRIFT_IGNORE_MS => {
+            let far = ((d.abs() as f32 - 50.0) / 450.0).clamp(0.0, 1.0);
+            let off = 4.0 + 5.0 * far;
+            (if d > 0 { -off } else { off }, false)
+        }
+        _ => (0.0, false),
+    }
+}
+
+/// "Marko · kasni 120 ms". Just the name when the server doesn't say.
+fn dot_text(name: &str, sync: Option<MemberSync>, playing: bool) -> String {
+    let state = match sync {
+        None => return name.to_string(),
+        Some(s) if s.loading => s::DOT_LOADING.to_string(),
+        Some(MemberSync {
+            drift_ms: Some(d), ..
+        }) if (d as i64).abs() > shared::sync::DRIFT_IGNORE_MS => s::dot_drift(d),
+        Some(MemberSync {
+            drift_ms: Some(_), ..
+        }) => s::DOT_SYNCED.to_string(),
+        Some(_) if playing => s::DOT_WAITING.to_string(),
+        Some(_) => return name.to_string(),
+    };
+    format!("{name} · {state}")
+}
+
+/// One dot per person on a shared line. On the line: in sync. Off it:
+/// ahead (above), behind (below) or still loading (a ring hanging below).
+/// When everyone is on it while a song plays, the line lights up.
+fn sync_dots(ui: &mut egui::Ui, view: &View) {
+    const H: f32 = 30.0;
+    const STEP: f32 = 16.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), H), Sense::hover());
+    let n = view.members.len();
+    if n == 0 {
+        return;
+    }
+    let step = STEP.min((rect.width() - 12.0) / n as f32);
+    let x0 = rect.center().x - step * (n - 1) as f32 / 2.0;
+    let y = rect.center().y;
+    let playing = matches!(view.phase, Phase::Playing);
+    let dots: Vec<_> = view
+        .members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let me = view.me.as_ref().is_some_and(|me| me.id == m.id);
+            let sync = if me { Some(view.sync()) } else { m.sync };
+            (x0 + step * i as f32, m, me, sync)
+        })
+        .collect();
+    let together = playing && dots.iter().all(|d| dot_place(d.3) == (0.0, false));
+    let lit = ui
+        .ctx()
+        .animate_bool_with_time(Id::unique("sync_line"), together, 0.25);
+    let p = ui.painter_at(rect);
+    p.hline(
+        rect.x_range(),
+        y,
+        Stroke::new(
+            1.0 + 0.5 * lit,
+            theme::mix(theme::BORDER, theme::GOOD, 0.8 * lit),
+        ),
+    );
+    for (x, m, me, sync) in &dots {
+        let (dy, ring) = dot_place(*sync);
+        let dy = ui
+            .ctx()
+            .animate_value_with_time(Id::unique(("sync_dot", m.id)), dy, 0.22);
+        let c = pos2(*x, y + dy);
+        let r = if *me { 4.5 } else { 3.5 };
+        let color = theme::name_color(&m.name);
+        // A gap in the line around each dot.
+        p.circle_filled(c, r + 2.0, theme::CARD);
+        if ring {
+            p.circle_stroke(c, r - 0.75, Stroke::new(1.5, color));
+        } else {
+            p.circle_filled(c, r, color);
+        }
+    }
+    if let Some(pos) = resp.hover_pos() {
+        let near = dots
+            .iter()
+            .filter(|d| (d.0 - pos.x).abs() <= (step / 2.0).max(5.0))
+            .min_by(|a, b| (a.0 - pos.x).abs().total_cmp(&(b.0 - pos.x).abs()));
+        let text = match near {
+            Some((_, m, _, sync)) => dot_text(&m.name, *sync, playing),
+            None => status(view).0,
+        };
+        resp.on_hover_text_at_pointer(text);
+    }
+}
+
+fn member_row(ui: &mut egui::Ui, name: &str, me: bool, sync: Option<MemberSync>) {
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
         let c = theme::name_color(name);
@@ -1972,7 +2753,12 @@ fn member_row(ui: &mut egui::Ui, name: &str, me: bool) {
             c,
         );
         p.circle_filled(r.right_bottom() - vec2(3.0, 3.0), 4.5, theme::PANEL);
-        p.circle_filled(r.right_bottom() - vec2(3.0, 3.0), 3.0, theme::GOOD);
+        let state = if dot_place(sync) == (0.0, false) {
+            theme::GOOD
+        } else {
+            theme::WARN
+        };
+        p.circle_filled(r.right_bottom() - vec2(3.0, 3.0), 3.0, state);
         let text = RichText::new(name).color(theme::TEXT);
         ui.add(egui::Label::new(if me { text.strong() } else { text }).truncate());
         if me {
@@ -1990,8 +2776,13 @@ fn sync_card(ui: &mut egui::Ui, view: &View) {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 4.0;
             section_label(ui, s::SYNC_TITLE);
-            let (status_text, status_color) = status(view);
-            kv(ui, s::STATUS, &status_text, status_color);
+            sync_dots(ui, view);
+            // While a song plays the dots say it (the words are their
+            // tooltip); every other state still gets its words.
+            if !matches!(view.phase, Phase::Playing) {
+                let (status_text, status_color) = status(view);
+                kv(ui, s::STATUS, &status_text, status_color);
+            }
             kv(
                 ui,
                 s::PING,
@@ -2032,13 +2823,13 @@ fn status(view: &View) -> (String, Color32) {
             Some(PlayStatus::Stopped) | None => (s::PHASE_STOPPED.into(), theme::TEXT_FAINT),
             _ => (s::IDLE.into(), theme::TEXT_DIM),
         },
-        Phase::Resolving => (s::PHASE_RESOLVING.into(), theme::ACCENT),
-        Phase::Buffering => (s::PHASE_BUFFERING.into(), theme::ACCENT),
+        Phase::Resolving => (s::PHASE_RESOLVING.into(), theme::accent()),
+        Phase::Buffering => (s::PHASE_BUFFERING.into(), theme::accent()),
         Phase::Waiting => {
             if view.room.as_ref().is_some_and(|r| r.waiting_for_ready) {
                 (s::PHASE_WAITING.into(), theme::WARN)
             } else {
-                (s::PHASE_STARTING.into(), theme::ACCENT)
+                (s::PHASE_STARTING.into(), theme::accent())
             }
         }
         Phase::Paused => (s::PHASE_PAUSED.into(), theme::TEXT_DIM),
@@ -2132,15 +2923,41 @@ impl eframe::App for App {
         let view = self.view();
         let ctx = ui.ctx().clone();
         self.thumbs.begin_frame(&ctx);
+        self.update_accent(&ctx, &view);
+        self.video_rect = None;
+        self.video_cut = 0.0;
+        if view.video_closed != self.video_closed_seen {
+            // The user closed the video window: video mode is off now.
+            self.video_closed_seen = view.video_closed;
+            if self.config.video {
+                self.config.video = false;
+                self.config.save();
+            }
+        }
         match &self.screen {
             Screen::Deps(shared) => {
                 let shared = shared.clone();
                 self.deps_ui(ui, &view, shared);
             }
             Screen::Connect => self.connect_ui(ui, &view),
-            Screen::Room => self.room_ui(ui, &view),
+            Screen::Room => {
+                self.room_ui(ui, &view);
+                if self.settings_open && matches!(self.screen, Screen::Room) {
+                    self.settings_ui(&ctx);
+                }
+            }
+        }
+        if !matches!(self.screen, Screen::Room) && self.video_full {
+            self.set_video_full(&ctx, false);
         }
         self.toasts_ui(&ctx, &view);
+        // The native video area covers egui drawing: hide it under menus
+        // and windows.
+        let covered = self.settings_open || egui::Popup::is_any_open(&ctx);
+        let rect = self.video_rect.filter(|_| !covered);
+        if let Some(h) = &mut self.video_host {
+            h.place(rect, self.video_cut, ctx.pixels_per_point());
+        }
         // Animate the progress bar only while something plays, about one
         // repaint per pixel of progress (bounded).
         if matches!(self.screen, Screen::Room) && view.is_playing() {
@@ -2193,6 +3010,24 @@ mod tests {
             s::SEARCH_NOTHING,
             s::SEARCH_FAILED,
             s::SEARCH_HINT,
+            s::SEARCH_SONGS,
+            s::SEARCH_PLAYLISTS,
+            s::PLAYLIST_TAG,
+            s::SEARCH_HINT_PLAYLISTS,
+            s::ADD_PLAYLIST,
+            s::SETTINGS,
+            s::CLOSE,
+            s::EQ_TITLE,
+            s::EQ_HINT,
+            s::EQ_RESET,
+            s::EQ_CUSTOM,
+            s::VIDEO_TITLE,
+            s::VIDEO_EXPLAIN,
+            s::VIDEO_FULL_HINT,
+            s::EXIT_FULLSCREEN,
+            s::ON,
+            s::OFF,
+            "Ravno Bas Rok Pop Vokal Elektronika +12 dB −12 32 64 125 250 500 1k 2k 4k 8k 16k",
             s::NORMALIZE,
             s::NORMALIZE_ON,
             s::NORMALIZE_OFF,
@@ -2231,6 +3066,11 @@ mod tests {
             s::LOADING_PLAYLIST,
             s::QUEUE_EMPTY_HINT,
             s::CLOCK_OK,
+            s::DOT_SYNCED,
+            s::DOT_LOADING,
+            s::DOT_WAITING,
+            &s::dot_drift(-120),
+            &s::dot_drift(120),
             s::DOUBLE_CLICK_HINT,
             &s::NOW_PLAYING.to_uppercase(),
             &s::SYNC_TITLE.to_uppercase(),

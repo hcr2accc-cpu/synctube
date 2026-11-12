@@ -20,6 +20,8 @@ pub enum Icon {
     Note,
     Search,
     PlayNext,
+    Gear,
+    ExitFullscreen,
 }
 
 /// A framed button showing `icon`, `size` points square.
@@ -72,9 +74,9 @@ pub fn round(ui: &mut egui::Ui, icon: Icon, size: f32, enabled: bool) -> Respons
     let fill = if !enabled {
         theme::CARD_HOVER
     } else if resp.hovered() && !resp.is_pointer_button_down_on() {
-        theme::ACCENT_HOVER
+        theme::accent_hover()
     } else {
-        theme::ACCENT
+        theme::accent()
     };
     ui.painter().circle_filled(rect.center(), size / 2.0, fill);
     let mut inner = rect.shrink(size * 0.32);
@@ -82,7 +84,7 @@ pub fn round(ui: &mut egui::Ui, icon: Icon, size: f32, enabled: bool) -> Respons
         inner = inner.translate(vec2(size * 0.03, 0.0));
     }
     let fg = if enabled {
-        Color32::WHITE
+        theme::ON_ACCENT
     } else {
         theme::TEXT_FAINT
     };
@@ -333,6 +335,33 @@ pub fn paint(painter: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
                 ],
                 color,
             );
+        }
+        Icon::Gear => {
+            let thin = Stroke::new((w * 0.13).max(1.4), color);
+            let c = r.center();
+            let ro = w * 0.5;
+            let ri = w * 0.34;
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::TAU / 8.0;
+                let d = vec2(a.cos(), a.sin());
+                painter.line_segment([c + d * ri, c + d * ro], Stroke::new(w * 0.2, color));
+            }
+            painter.circle_stroke(c, ri, thin);
+            painter.circle_stroke(c, w * 0.13, thin);
+        }
+        Icon::ExitFullscreen => {
+            // Four corners pointing inward.
+            let k = w * 0.36;
+            for (cx0, cy0, sx, sy) in [
+                (l + k, t + k, -1.0, -1.0),
+                (rt - k, t + k, 1.0, -1.0),
+                (l + k, b - k, -1.0, 1.0),
+                (rt - k, b - k, 1.0, 1.0),
+            ] {
+                let c = pos2(cx0, cy0);
+                painter.line_segment([c, pos2(cx0 + sx * k, cy0)], stroke);
+                painter.line_segment([c, pos2(cx0, cy0 + sy * k)], stroke);
+            }
         }
         Icon::Volume | Icon::Mute => {
             let box_r = l + w * 0.3;

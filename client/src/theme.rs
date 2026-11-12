@@ -1,5 +1,6 @@
 //! Colors, fonts and widget styling for the whole app.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -16,8 +17,8 @@ pub const BORDER: Color32 = Color32::from_rgb(0x2a, 0x2e, 0x3a);
 pub const TEXT: Color32 = Color32::from_rgb(0xe8, 0xea, 0xf0);
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9a, 0xa0, 0xb0);
 pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6a, 0x70, 0x80);
+/// The brand accent: the logo, and the UI while no song colours it.
 pub const ACCENT: Color32 = Color32::from_rgb(0x8b, 0x7b, 0xff);
-pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0xa0, 0x93, 0xff);
 pub const ACCENT_2: Color32 = Color32::from_rgb(0xec, 0x5c, 0xa8);
 pub const GOOD: Color32 = Color32::from_rgb(0x4a, 0xde, 0x80);
 pub const WARN: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);
@@ -38,19 +39,104 @@ pub fn bold_font(size: f32) -> FontId {
     FontId::new(size, bold())
 }
 
-/// Accent color with the given alpha (0–255).
-pub fn accent_alpha(a: u8) -> Color32 {
-    Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), a)
+/// The accent in use right now. It follows the playing song's thumbnail
+/// (the GUI sets it every frame), so it is a value, not a constant.
+static LIVE_ACCENT: AtomicU32 = AtomicU32::new(pack(ACCENT));
+
+const fn pack(c: Color32) -> u32 {
+    ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32
 }
 
-/// A stable, pleasant color for a name (avatars, "added by").
+pub fn accent() -> Color32 {
+    let v = LIVE_ACCENT.load(Ordering::Relaxed);
+    Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+pub fn set_accent(c: Color32) {
+    LIVE_ACCENT.store(pack(c), Ordering::Relaxed);
+}
+
+pub fn accent_hover() -> Color32 {
+    mix(accent(), Color32::WHITE, 0.16)
+}
+
+/// Text and icons drawn on an accent fill. Every accent is kept light
+/// enough ([`ACCENT_LUM`]) for dark text to read well on it.
+pub const ON_ACCENT: Color32 = Color32::from_rgb(0x0c, 0x0d, 0x12);
+
+/// Accent color with the given alpha (0–255).
+pub fn accent_alpha(a: u8) -> Color32 {
+    let c = accent();
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// `a` moved `t` (0–1) of the way to `b`.
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(ch(a.r(), b.r()), ch(a.g(), b.g()), ch(a.b(), b.b()))
+}
+
+/// Relative luminance (0 = black, 1 = white).
+pub fn luminance(c: Color32) -> f32 {
+    let lin = |v: u8| {
+        let v = v as f32 / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// Allowed luminance of an accent: light enough to read as text on the dark
+/// panels and under dark text, not so light that it glares.
+pub const ACCENT_LUM: std::ops::RangeInclusive<f32> = 0.24..=0.60;
+const ACCENT_MIN_SAT: f32 = 0.42;
+
+/// Turns a colour taken from a thumbnail into a usable accent: same hue,
+/// saturation and lightness pulled into a readable range.
+pub fn accent_from(rgb: [u8; 3]) -> Color32 {
+    let mut hsva = egui::ecolor::Hsva::from_srgb(rgb);
+    hsva.s = hsva.s.max(ACCENT_MIN_SAT);
+    hsva.v = hsva.v.max(0.6);
+    let [r, g, b] = hsva.to_srgb();
+    let mut c = Color32::from_rgb(r, g, b);
+    // Too dark: lift toward white. Too light: lower toward black.
+    for _ in 0..40 {
+        let l = luminance(c);
+        if l < *ACCENT_LUM.start() {
+            c = mix(c, Color32::WHITE, 0.06);
+        } else if l > *ACCENT_LUM.end() {
+            c = mix(c, Color32::BLACK, 0.04);
+        } else {
+            break;
+        }
+    }
+    c
+}
+
+/// Colours for people (avatars, "added by", sync dots). Picked by hand to
+/// sit well together on the dark panels.
+const PEOPLE: [Color32; 8] = [
+    Color32::from_rgb(0xf2, 0xb8, 0x4b), // amber
+    Color32::from_rgb(0xf0, 0x78, 0x5a), // coral
+    Color32::from_rgb(0xe8, 0x6a, 0x9a), // rose
+    Color32::from_rgb(0xb4, 0x97, 0xf0), // lilac
+    Color32::from_rgb(0x62, 0xb6, 0xf0), // sky
+    Color32::from_rgb(0x4f, 0xc7, 0xb5), // teal
+    Color32::from_rgb(0xa8, 0xd6, 0x5c), // lime
+    Color32::from_rgb(0xd9, 0xc3, 0xa0), // sand
+];
+
+/// A stable color for a name (avatars, "added by", sync dots).
 pub fn name_color(name: &str) -> Color32 {
     let mut h: u32 = 2166136261;
     for b in name.to_lowercase().bytes() {
         h = (h ^ b as u32).wrapping_mul(16777619);
     }
-    let hue = (h % 360) as f32 / 360.0;
-    egui::ecolor::Hsva::new(hue, 0.5, 0.92, 1.0).into()
+    PEOPLE[(h >> 8) as usize % PEOPLE.len()]
 }
 
 pub fn install(ctx: &egui::Context) {
@@ -190,11 +276,8 @@ fn style(style: &mut egui::Style) {
     v.extreme_bg_color = FIELD;
     v.text_edit_bg_color = Some(FIELD);
     v.faint_bg_color = CARD;
-    v.hyperlink_color = ACCENT;
     v.error_fg_color = BAD;
     v.warn_fg_color = WARN;
-    v.selection.bg_fill = accent_alpha(110);
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
     v.slider_trailing_fill = true;
     v.weak_text_color = Some(TEXT_DIM);
 
@@ -219,12 +302,63 @@ fn style(style: &mut egui::Style) {
     w.hovered.corner_radius = r;
     w.hovered.expansion = 0.0;
 
-    w.active.bg_fill = ACCENT;
     w.active.weak_bg_fill = Color32::from_rgb(0x2c, 0x30, 0x3c);
-    w.active.bg_stroke = Stroke::new(1.0, ACCENT);
     w.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
     w.active.corner_radius = r;
     w.active.expansion = 0.0;
 
-    w.open = w.active;
+    apply_accent(v);
+}
+
+/// The parts of egui's own style that carry the accent. Called again
+/// whenever the accent changes.
+pub fn apply_accent(v: &mut egui::Visuals) {
+    let a = accent();
+    v.hyperlink_color = a;
+    v.selection.bg_fill = accent_alpha(110);
+    v.selection.stroke = Stroke::new(1.0, a);
+    v.widgets.active.bg_fill = a;
+    v.widgets.active.bg_stroke = Stroke::new(1.0, a);
+    v.widgets.open = v.widgets.active;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accents_stay_readable() {
+        // Whatever a thumbnail gives (near black, pure blue, pure yellow,
+        // washed-out pink), the accent lands in the readable range.
+        for rgb in [
+            [12, 8, 40],
+            [0, 0, 255],
+            [255, 255, 0],
+            [250, 235, 240],
+            [200, 30, 30],
+            [20, 90, 60],
+        ] {
+            let c = accent_from(rgb);
+            let l = luminance(c);
+            assert!(ACCENT_LUM.contains(&l), "{rgb:?} -> {c:?} lum {l}");
+            // Dark text on it: at least 4.5:1.
+            let contrast = (l + 0.05) / (luminance(ON_ACCENT) + 0.05);
+            assert!(contrast >= 4.5, "{rgb:?} contrast {contrast}");
+        }
+        assert!(ACCENT_LUM.contains(&luminance(ACCENT)));
+    }
+
+    #[test]
+    fn accent_keeps_the_hue() {
+        let c = accent_from([180, 20, 20]);
+        assert!(c.r() > c.g() && c.r() > c.b());
+        let c = accent_from([10, 40, 160]);
+        assert!(c.b() > c.r() && c.b() > c.g());
+    }
+
+    #[test]
+    fn name_colors_are_stable() {
+        assert_eq!(name_color("Ana"), name_color("ana"));
+        assert!(PEOPLE.contains(&name_color("Bojan")));
+    }
 }

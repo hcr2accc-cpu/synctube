@@ -20,6 +20,8 @@ pub enum PlayerEvent {
     Failed { entry: u64, error: String },
     /// The player process died.
     Crashed,
+    /// The video window was closed.
+    VideoClosed,
 }
 
 pub enum Player {
@@ -28,16 +30,59 @@ pub enum Player {
 }
 
 impl Player {
-    /// Loads `url` paused at `start_ms`. Returns the entry id used in events.
+    /// Loads `url` paused at `start_ms` (plus `video` as its picture, if
+    /// given). Returns the entry id used in events.
     pub async fn load(
         &self,
         url: &str,
         start_ms: u64,
         duration_ms: Option<u64>,
+        title: &str,
+        video: Option<&str>,
     ) -> Result<u64, String> {
         match self {
-            Player::Mpv(m) => m.load(url, start_ms as f64 / 1000.0).await,
+            Player::Mpv(m) => m.load(url, start_ms as f64 / 1000.0, title, video).await,
             Player::Fake(f) => Ok(f.load(start_ms, duration_ms)),
+        }
+    }
+
+    /// Shows or hides the video window.
+    pub async fn set_video(&self, on: bool) {
+        if let Player::Mpv(m) = self {
+            let (vid, window) = if on { ("1", "yes") } else { ("no", "no") };
+            let _ = m.set_property("vid", json!(vid)).await;
+            let _ = m.set_property("force-window", json!(window)).await;
+        }
+    }
+
+    /// Adds a video track to the song that is playing (opened in the
+    /// background, so playback does not stall).
+    pub async fn add_video(&self, url: &str) {
+        if let Player::Mpv(m) = self {
+            if let Err(e) = m.command_async(json!(["video-add", url, "select"])).await {
+                tracing::warn!("cannot add video: {e}");
+            }
+        }
+    }
+
+    /// Replaces the audio filter chain ("" removes it).
+    pub async fn set_af(&self, af: &str) {
+        if let Player::Mpv(m) = self {
+            if let Err(e) = m.set_property("af", json!(af)).await {
+                tracing::warn!("cannot set audio filter: {e}");
+            }
+        }
+    }
+
+    /// Changes a parameter of a running equalizer filter in place.
+    pub async fn eq_command(&self, target: &str, cmd: &str, arg: &str) {
+        if let Player::Mpv(m) = self {
+            let r = m
+                .command(json!(["af-command", crate::eq::LABEL, cmd, arg, target]))
+                .await;
+            if let Err(e) = r {
+                tracing::debug!(target, "eq command failed: {e}");
+            }
         }
     }
 

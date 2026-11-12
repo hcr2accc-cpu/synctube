@@ -112,6 +112,9 @@ fn main() {
         volume: args.volume,
         normalize: args.normalize,
         auto_update: !args.no_update && !args.fake_audio,
+        eq: client::eq::EqSettings::default(),
+        video: false,
+        video_wid: None,
     };
     let handle = engine::start(cfg, Arc::new(|| {}));
     handle.send(Command::Connect {

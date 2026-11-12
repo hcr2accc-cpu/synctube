@@ -18,11 +18,17 @@ const MAX_BYTES: u64 = 512 * 1024;
 
 enum Slot {
     Loading,
-    Ready { tex: TextureHandle, used: u64 },
+    Ready {
+        tex: TextureHandle,
+        used: u64,
+        tint: Option<[u8; 3]>,
+    },
     Failed,
 }
 
-type Done = Arc<Mutex<Vec<(String, Option<ColorImage>)>>>;
+/// A decoded thumbnail and its dominant colour.
+type Decoded = (ColorImage, Option<[u8; 3]>);
+type Done = Arc<Mutex<Vec<(String, Option<Decoded>)>>>;
 
 pub struct Thumbs {
     slots: HashMap<String, Slot>,
@@ -74,9 +80,10 @@ impl Thumbs {
         let finished = std::mem::take(&mut *self.done.lock().unwrap());
         for (id, img) in finished {
             let slot = match img {
-                Some(img) => Slot::Ready {
+                Some((img, tint)) => Slot::Ready {
                     tex: ctx.load_texture(format!("thumb-{id}"), img, TextureOptions::LINEAR),
                     used: self.frame,
+                    tint,
                 },
                 None => Slot::Failed,
             };
@@ -106,7 +113,7 @@ impl Thumbs {
     /// Texture for a video's thumbnail, if loaded. Starts loading it otherwise.
     pub fn get(&mut self, youtube_id: &str) -> Option<TextureId> {
         match self.slots.get_mut(youtube_id) {
-            Some(Slot::Ready { tex, used }) => {
+            Some(Slot::Ready { tex, used, .. }) => {
                 *used = self.frame;
                 Some(tex.id())
             }
@@ -123,7 +130,62 @@ impl Thumbs {
     }
 }
 
-fn fetch(agent: &ureq::Agent, id: &str) -> Result<ColorImage, String> {
+impl Thumbs {
+    /// The thumbnail's dominant colour. `None` while it is still loading
+    /// (which this starts), `Some(None)` when it has no clear colour.
+    pub fn tint(&mut self, youtube_id: &str) -> Option<Option<[u8; 3]>> {
+        self.get(youtube_id);
+        match self.slots.get(youtube_id) {
+            Some(Slot::Ready { tint, .. }) => Some(*tint),
+            Some(Slot::Failed) => Some(None),
+            _ => None,
+        }
+    }
+}
+
+const HUE_BINS: usize = 18;
+/// Pixels greyer or darker than this say nothing about the picture's colour
+/// (letterbox bars, shadows, white text).
+const MIN_SAT: f32 = 0.25;
+const MIN_VALUE: f32 = 0.2;
+/// The winning hue must cover at least this share of the picture.
+const MIN_SHARE: f32 = 0.04;
+
+/// The colour a picture is "about": the average of its most common vivid
+/// hue. `None` for grey or nearly colourless pictures.
+pub fn dominant_color(img: &ColorImage) -> Option<[u8; 3]> {
+    let mut weight = [0f32; HUE_BINS];
+    let mut count = [0u32; HUE_BINS];
+    let mut sum = [[0f32; 3]; HUE_BINS];
+    for px in &img.pixels {
+        let rgb = [px.r(), px.g(), px.b()];
+        let hsva = egui::ecolor::Hsva::from_srgb(rgb);
+        if hsva.s < MIN_SAT || hsva.v < MIN_VALUE {
+            continue;
+        }
+        let bin = ((hsva.h * HUE_BINS as f32) as usize).min(HUE_BINS - 1);
+        // Vivid pixels count for more than dull ones.
+        let w = hsva.s * hsva.v;
+        weight[bin] += w;
+        count[bin] += 1;
+        for (s, c) in sum[bin].iter_mut().zip(rgb) {
+            *s += c as f32 * w;
+        }
+    }
+    // A hue split across two neighbouring bins still wins.
+    let score = |i: usize| {
+        weight[i] + 0.5 * (weight[(i + 1) % HUE_BINS] + weight[(i + HUE_BINS - 1) % HUE_BINS])
+    };
+    let best = (0..HUE_BINS).max_by(|a, b| score(*a).total_cmp(&score(*b)))?;
+    let around =
+        count[best] + count[(best + 1) % HUE_BINS] + count[(best + HUE_BINS - 1) % HUE_BINS];
+    if weight[best] <= 0.0 || (around as f32) < img.pixels.len() as f32 * MIN_SHARE {
+        return None;
+    }
+    Some(sum[best].map(|s| (s / weight[best]).round() as u8))
+}
+
+fn fetch(agent: &ureq::Agent, id: &str) -> Result<Decoded, String> {
     if !shared::youtube::is_valid_video_id(id) {
         return Err("invalid id".into());
     }
@@ -141,8 +203,39 @@ fn fetch(agent: &ureq::Agent, id: &str) -> Result<ColorImage, String> {
         .map_err(|e| e.to_string())?
         .resize_to_fill(W, H, image::imageops::FilterType::Triangle)
         .to_rgba8();
-    Ok(ColorImage::from_rgba_unmultiplied(
+    let img = ColorImage::from_rgba_unmultiplied(
         [img.width() as usize, img.height() as usize],
         img.as_raw(),
-    ))
+    );
+    let tint = dominant_color(&img);
+    Ok((img, tint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::Color32;
+
+    fn image(pixels: Vec<Color32>) -> ColorImage {
+        ColorImage::new([pixels.len(), 1], pixels)
+    }
+
+    #[test]
+    fn grey_pictures_have_no_colour() {
+        let mut px = vec![Color32::from_gray(30); 500];
+        px.extend(vec![Color32::from_gray(220); 500]);
+        // A few coloured pixels (a logo in the corner) are not enough.
+        px.extend(vec![Color32::from_rgb(255, 0, 0); 10]);
+        assert_eq!(dominant_color(&image(px)), None);
+    }
+
+    #[test]
+    fn finds_the_main_colour() {
+        // Black bars, a lot of teal, a little red.
+        let mut px = vec![Color32::BLACK; 300];
+        px.extend(vec![Color32::from_rgb(20, 170, 160); 500]);
+        px.extend(vec![Color32::from_rgb(230, 30, 30); 200]);
+        let [r, g, b] = dominant_color(&image(px)).unwrap();
+        assert!(g > r && b > r, "{r} {g} {b}");
+    }
 }
