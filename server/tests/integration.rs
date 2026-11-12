@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use server::Config;
-use shared::{ClientMsg, Member, PlayStatus, RoomState, ServerMsg, TrackInfo};
+use shared::{ClientMsg, Member, MemberSync, PlayStatus, RoomState, ServerMsg, TrackInfo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
@@ -793,4 +793,37 @@ async fn ping_pong_and_empty_room_cleanup() {
         .await
         .unwrap();
     assert!(c.state.queue.is_empty());
+}
+
+/// A member's reported status reaches everyone in the room's member list.
+#[tokio::test]
+async fn status_is_relayed_in_members() {
+    let (url, _) = start(fast_cfg()).await;
+    let mut a = Client::join(&url, "status", "Ana", None).await.unwrap();
+    let mut b = Client::join(&url, "status", "Bojan", None).await.unwrap();
+    assert_eq!(a.you.sync, Some(MemberSync::default()));
+    let b_id = b.you.id;
+    b.send(ClientMsg::Status {
+        loading: false,
+        drift_ms: Some(120),
+    })
+    .await;
+    let want = Some(MemberSync {
+        loading: false,
+        drift_ms: Some(120),
+    });
+    a.wait_for("Bojan's status", |m| {
+        matches!(m, ServerMsg::Members { list }
+            if list.iter().any(|m| m.id == b_id && m.sync == want))
+    })
+    .await;
+    // The same status again changes nothing, so nothing is broadcast.
+    a.drain(Duration::from_millis(100)).await;
+    b.send(ClientMsg::Status {
+        loading: false,
+        drift_ms: Some(120),
+    })
+    .await;
+    let extra = a.drain(Duration::from_millis(300)).await;
+    assert!(!extra.iter().any(|m| matches!(m, ServerMsg::Members { .. })));
 }

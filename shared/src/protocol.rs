@@ -49,11 +49,27 @@ impl PlaybackState {
     }
 }
 
+/// How a member's player stands against the shared timeline (what the
+/// member last reported with `ClientMsg::Status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MemberSync {
+    /// Resolving, buffering or seeking.
+    #[serde(default)]
+    pub loading: bool,
+    /// Drift against the timeline while playing (positive = ahead).
+    #[serde(default)]
+    pub drift_ms: Option<i32>,
+}
+
 /// A connected room member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Member {
     pub id: Uuid,
     pub name: String,
+    /// Missing from servers that don't relay member status. A client only
+    /// sends `Status` to a server that includes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<MemberSync>,
 }
 
 /// Full room snapshot (small enough to send on every change).
@@ -138,6 +154,13 @@ pub enum ClientMsg {
     Ping {
         client_ms: u64,
     },
+    /// How this client's player is doing; relayed to the room in `Members`.
+    Status {
+        #[serde(default)]
+        loading: bool,
+        #[serde(default)]
+        drift_ms: Option<i32>,
+    },
     Leave,
 }
 
@@ -196,6 +219,15 @@ mod tests {
         assert_eq!(m, ClientMsg::Next { version: None });
         let m: ClientMsg = serde_json::from_str(r#"{"type":"Play"}"#).unwrap();
         assert_eq!(m, ClientMsg::Play);
+    }
+
+    #[test]
+    fn member_without_sync_parses() {
+        let id = Uuid::new_v4();
+        let m: Member = serde_json::from_str(&format!(r#"{{"id":"{id}","name":"Ana"}}"#)).unwrap();
+        assert_eq!(m.sync, None);
+        // And a member without status serializes the old way.
+        assert!(!serde_json::to_string(&m).unwrap().contains("sync"));
     }
 
     #[test]

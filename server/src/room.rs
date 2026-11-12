@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use shared::limits::{clamp_chars, MAX_QUEUE, MAX_TITLE_CHARS};
 use shared::youtube::{is_valid_video_id, parse_youtube_url, playlist_url, watch_url, YoutubeRef};
-use shared::{ClientMsg, Member, PlayStatus, PlaybackState, RoomState, ServerMsg, Track};
+use shared::{
+    ClientMsg, Member, MemberSync, PlayStatus, PlaybackState, RoomState, ServerMsg, Track,
+};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -22,6 +24,8 @@ const RESOLVE_TTL: Duration = Duration::from_secs(180);
 const MAX_PENDING_PER_CONN: usize = 5;
 /// "Previous" restarts the current track when it played longer than this.
 const PREVIOUS_RESTART_MS: u64 = 3000;
+/// Reported drift is only for display; keep it in a sane range.
+const MAX_REPORTED_DRIFT_MS: i32 = 10_000;
 
 pub(crate) enum RoomCmd {
     Join {
@@ -44,6 +48,8 @@ struct MemberConn {
     id: Uuid,
     name: String,
     out: mpsc::Sender<Out>,
+    /// Last status the member reported.
+    sync: MemberSync,
 }
 
 struct Barrier {
@@ -137,6 +143,7 @@ impl Room {
             .map(|m| Member {
                 id: m.id,
                 name: m.name.clone(),
+                sync: Some(m.sync),
             })
             .collect()
     }
@@ -397,11 +404,13 @@ impl Room {
         let me = Member {
             id: conn,
             name: name.clone(),
+            sync: Some(MemberSync::default()),
         };
         self.members.push(MemberConn {
             id: conn,
             name: name.clone(),
             out,
+            sync: MemberSync::default(),
         });
         self.empty_since = None;
         tracing::info!(room = %self.name, %name, members = self.members.len(), "member joined");
@@ -544,6 +553,22 @@ impl Room {
                     }
                 }
                 self.check_barrier();
+            }
+            ClientMsg::Status { loading, drift_ms } => {
+                let sync = MemberSync {
+                    loading,
+                    drift_ms: drift_ms
+                        .map(|d| d.clamp(-MAX_REPORTED_DRIFT_MS, MAX_REPORTED_DRIFT_MS)),
+                };
+                let Some(m) = self.members.iter_mut().find(|m| m.id == conn) else {
+                    return;
+                };
+                if m.sync != sync {
+                    m.sync = sync;
+                    self.broadcast(&ServerMsg::Members {
+                        list: self.members_list(),
+                    });
+                }
             }
             ClientMsg::Ended { version } => {
                 if version == self.playback.version
