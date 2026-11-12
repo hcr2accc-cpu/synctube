@@ -46,8 +46,8 @@ impl Default for Config {
         Self {
             barrier_timeout: Duration::from_secs(6),
             seek_barrier_timeout: Duration::from_secs(3),
-            start_lead_ms: 500,
-            resume_lead_ms: 300,
+            start_lead_ms: 400,
+            resume_lead_ms: 250,
             end_grace_ms: 2000,
             empty_room_ttl: Duration::from_secs(30 * 60),
             ws_ping_interval: Duration::from_secs(20),
@@ -152,5 +152,13 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 /// Serves on an already bound listener until the process ends.
 pub async fn serve(listener: TcpListener, config: Config) -> std::io::Result<()> {
+    use axum::serve::ListenerExt;
+    // Small messages (pongs, state updates) go out at once instead of
+    // waiting for Nagle's algorithm: lower ping and tighter sync.
+    let listener = listener.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            tracing::debug!("cannot set TCP_NODELAY: {e}");
+        }
+    });
     axum::serve(listener, app(config)).await
 }
