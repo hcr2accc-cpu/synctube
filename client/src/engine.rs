@@ -59,6 +59,12 @@ pub enum Command {
     PlayTrack(Uuid),
     Remove(Uuid),
     Move(Uuid, usize),
+    /// Shuffles the songs after the current one (all of them when nothing
+    /// plays); a second one while shuffling stops it.
+    Shuffle,
+    /// Removes every song from the room's queue; a second one while it
+    /// runs stops it.
+    ClearQueue,
     Add(String),
     /// Searches YouTube (videos, or playlists); results show up in
     /// [`View::search`].
@@ -102,6 +108,28 @@ pub enum Phase {
     Playing,
     Paused,
     Error(String),
+}
+
+/// A shuffle in progress: the new order of the upcoming songs.
+struct Shuffle {
+    order: Vec<Uuid>,
+    /// Songs of `order` placed so far.
+    done: usize,
+    /// The song placed last; the next one goes right after it.
+    prev: Option<Uuid>,
+    /// Room revision and time of the last move sent.
+    sent: Option<(u64, Instant)>,
+}
+
+/// A "remove everything" in progress. The server only knows single
+/// removals, so the songs go one at a time.
+struct Clear {
+    /// Songs to remove, the playing one last (removing it earlier would
+    /// start the next song for everyone).
+    ids: Vec<Uuid>,
+    done: usize,
+    /// Room revision and time of the last removal sent.
+    sent: Option<(u64, Instant)>,
 }
 
 /// A link that was submitted but is not in the queue yet. Shown right away
@@ -157,6 +185,10 @@ pub struct View {
     pub fake_audio: bool,
     /// Bumped when the user closed the video window (video mode turned off).
     pub video_closed: u64,
+    /// Songs still to be moved while a shuffle runs.
+    pub shuffle_left: Option<usize>,
+    /// Songs still to be removed while the queue is being cleared.
+    pub clear_left: Option<usize>,
 }
 
 impl View {
@@ -333,6 +365,10 @@ const GAIN_WAIT: Duration = Duration::from_millis(2500);
 const MEASURE_AHEAD: usize = 5;
 /// The next song starts downloading to disk this long after the current one
 /// started playing (its own buffer fills first).
+/// Gap between the moves of a shuffle (the server allows 20 messages/s).
+const SHUFFLE_GAP: Duration = Duration::from_millis(70);
+/// A move the server has not answered yet is given up on after this long.
+const SHUFFLE_WAIT: Duration = Duration::from_secs(1);
 const PREPARE_DELAY: Duration = Duration::from_secs(3);
 
 /// One submitted link, from `Add` until `AddResolved` is sent.
@@ -411,6 +447,8 @@ struct Engine {
     status_ok: bool,
     /// Last status reported to the room, and when.
     status_sent: Option<(MemberSync, Instant)>,
+    shuffle: Option<Shuffle>,
+    clear: Option<Clear>,
 }
 
 async fn sleep_opt(at: Option<Instant>) {
@@ -490,6 +528,8 @@ impl Engine {
             load_comp_local_ms: 250,
             status_ok: false,
             status_sent: None,
+            shuffle: None,
+            clear: None,
         }
     }
 
@@ -509,6 +549,8 @@ impl Engine {
             let spin_target = self.unpause_at;
             let wake_unpause = spin_target.map(|t| t - Duration::from_millis(SPIN_MS));
             let gain_hold = self.gain_hold_deadline();
+            let shuffle_at = self.shuffle_at();
+            let clear_at = self.clear_at();
             tokio::select! {
                 c = cmd_rx.recv() => {
                     match c {
@@ -534,6 +576,8 @@ impl Engine {
                 _ = sleep_opt(self.next_ping) => self.ping_tick(),
                 _ = sleep_opt(gain_hold) => self.release_gain_hold().await,
                 _ = sleep_opt(self.prepare_at) => self.prepare_next(),
+                _ = sleep_opt(shuffle_at) => self.shuffle_step(),
+                _ = sleep_opt(clear_at) => self.clear_step(),
             }
             self.publish();
         }
@@ -548,6 +592,8 @@ impl Engine {
         self.view.clock_synced = self.clock.is_synced();
         self.view.phase = self.phase();
         self.view.speed = self.cur.as_ref().map_or(1.0, |c| c.speed);
+        self.view.shuffle_left = self.shuffle.as_ref().map(|s| s.order.len() - s.done);
+        self.view.clear_left = self.clear.as_ref().map(|c| c.ids.len() - c.done);
         self.report_status();
         self.adds
             .retain(|j| j.request_id.is_some() || j.started.elapsed() < ADD_ANSWER_TIMEOUT);
@@ -672,6 +718,8 @@ impl Engine {
                 track_id,
                 new_index,
             }),
+            Command::Shuffle => self.start_shuffle(),
+            Command::ClearQueue => self.start_clear(),
             Command::Add(url) => match parse_youtube_url(url.trim()) {
                 None => self.toast(strings::NOT_YOUTUBE, true),
                 Some(r) => {
@@ -764,6 +812,8 @@ impl Engine {
         self.view.members.clear();
         self.view.me = None;
         self.adds.clear();
+        self.shuffle = None;
+        self.clear = None;
         self.clock.reset();
         self.next_ping = None;
         self.unload().await;
@@ -881,7 +931,12 @@ impl Engine {
                     },
                 }
             }
-            ServerMsg::Toast { message } => self.toast(message, false),
+            ServerMsg::Toast { message } => {
+                // Older servers announce every add; the queue shows it already.
+                if !message.contains(" je dodao/la") {
+                    self.toast(message, false)
+                }
+            }
             ServerMsg::Error { message } => {
                 // An error right after `Add` (queue full, too many pending)
                 // means the oldest unanswered add will never be resolved.
@@ -1172,24 +1227,11 @@ impl Engine {
         self.cfg.video = on;
         let Some(p) = &self.player else { return };
         p.set_video(on).await;
-        if !on {
-            return;
-        }
-        // Turned on mid-song: open this song's video in the background.
-        let add = self.cur.as_mut().and_then(|c| {
-            let ready = matches!(
-                c.phase,
-                CurPhase::Active | CurPhase::AwaitGain | CurPhase::Seeking
-            );
-            if ready && !c.video_loaded {
-                c.video_loaded = c.video_url.is_some();
-                c.video_url.clone()
-            } else {
-                None
-            }
-        });
-        if let Some(url) = add {
-            p.add_video(&url).await;
+        if on && self.cur.is_some() {
+            // Turned on mid-song: load the song again, now with its video
+            // (adding a video track to a playing song crashes mpv).
+            self.unload().await;
+            self.reconcile().await;
         }
     }
 
@@ -1216,6 +1258,141 @@ impl Engine {
         let next = room.queue.get(i + 1)?;
         let id = &next.youtube_id;
         (cache.path(id).is_none() && !cache.busy(id)).then(|| id.clone())
+    }
+
+    // ----- shuffle ---------------------------------------------------------------
+
+    /// Picks a random order for the songs after the current one. The server
+    /// only knows single moves, so the songs are then moved one at a time,
+    /// each right after the one placed before it.
+    fn start_shuffle(&mut self) {
+        if self.shuffle.take().is_some() || self.clear.is_some() {
+            return;
+        }
+        let Some(room) = &self.room else {
+            return;
+        };
+        let from = room.playback.track_index.map_or(0, |i| i + 1);
+        let mut order: Vec<Uuid> = room.queue.iter().skip(from).map(|t| t.id).collect();
+        if order.len() < 2 {
+            return;
+        }
+        for i in (1..order.len()).rev() {
+            let j = (Uuid::new_v4().as_u128() % (i as u128 + 1)) as usize;
+            order.swap(i, j);
+        }
+        self.shuffle = Some(Shuffle {
+            order,
+            done: 0,
+            prev: None,
+            sent: None,
+        });
+    }
+
+    fn shuffle_at(&self) -> Option<Instant> {
+        let s = self.shuffle.as_ref()?;
+        Some(self.paced(s.sent))
+    }
+
+    /// When the next message of a paced series may go out: shortly after
+    /// the server answered the last one, or after a wait when it did not.
+    fn paced(&self, sent: Option<(u64, Instant)>) -> Instant {
+        let Some((rev, at)) = sent else {
+            return Instant::now();
+        };
+        let answered = self.room.as_ref().is_some_and(|r| r.revision > rev);
+        if answered {
+            at + SHUFFLE_GAP
+        } else {
+            at + SHUFFLE_WAIT
+        }
+    }
+
+    // ----- clear -------------------------------------------------------------------
+
+    /// Empties the queue for everyone (a second call stops it).
+    fn start_clear(&mut self) {
+        if self.clear.take().is_some() {
+            return;
+        }
+        let Some(room) = &self.room else {
+            return;
+        };
+        let current = room.current_track().map(|t| t.id);
+        let mut ids: Vec<Uuid> = room
+            .queue
+            .iter()
+            .rev()
+            .map(|t| t.id)
+            .filter(|id| Some(*id) != current)
+            .collect();
+        ids.extend(current);
+        if ids.is_empty() {
+            return;
+        }
+        self.shuffle = None;
+        self.clear = Some(Clear {
+            ids,
+            done: 0,
+            sent: None,
+        });
+    }
+
+    fn clear_at(&self) -> Option<Instant> {
+        let c = self.clear.as_ref()?;
+        Some(self.paced(c.sent))
+    }
+
+    /// Sends the next removal of a clear.
+    fn clear_step(&mut self) {
+        let (Some(room), Some(c)) = (&self.room, &mut self.clear) else {
+            self.clear = None;
+            return;
+        };
+        while c.done < c.ids.len() {
+            let id = c.ids[c.done];
+            c.done += 1;
+            if room.queue.iter().any(|t| t.id == id) {
+                c.sent = Some((room.revision, Instant::now()));
+                self.send(ClientMsg::Remove { track_id: id });
+                return;
+            }
+        }
+        self.clear = None;
+        self.toast(strings::QUEUE_CLEARED, false);
+    }
+
+    /// Sends the next move of a shuffle, based on the room as it is now.
+    fn shuffle_step(&mut self) {
+        let (Some(room), Some(s)) = (&self.room, &mut self.shuffle) else {
+            self.shuffle = None;
+            return;
+        };
+        let pos = |id: Uuid| room.queue.iter().position(|t| t.id == id);
+        while s.done < s.order.len() {
+            let id = s.order[s.done];
+            s.done += 1;
+            let Some(idx) = pos(id) else {
+                continue;
+            };
+            let anchor = s.prev.and_then(pos).or(room.playback.track_index);
+            s.prev = Some(id);
+            let target = anchor.map_or(0, |a| a + 1);
+            if idx == target {
+                continue;
+            }
+            // The server takes the song out first, then inserts it.
+            let new_index = if idx < target { target - 1 } else { target };
+            s.sent = Some((room.revision, Instant::now()));
+            let msg = ClientMsg::Move {
+                track_id: id,
+                new_index,
+            };
+            self.send(msg);
+            return;
+        }
+        self.shuffle = None;
+        self.toast(strings::SHUFFLED, false);
     }
 
     fn prepare_next(&mut self) {

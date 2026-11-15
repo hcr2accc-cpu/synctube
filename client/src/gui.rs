@@ -85,6 +85,8 @@ pub struct App {
     /// Search finds playlists instead of songs.
     search_playlists: bool,
     settings_open: bool,
+    /// The "remove every song?" question is showing.
+    confirm_clear: bool,
     /// Last `View::video_closed` seen.
     video_closed_seen: u64,
     /// Native area inside the window that mpv draws the video into.
@@ -138,6 +140,7 @@ impl App {
             volume: config.volume,
             search_playlists: config.search_playlists,
             settings_open: false,
+            confirm_clear: false,
             video_closed_seen: 0,
             video_host,
             video_rect: None,
@@ -954,23 +957,32 @@ impl App {
 
         let dur_right = btn.left() - 14.0;
         let text_left = thumb.right() + 12.0;
-        let max_w = (dur_right - 56.0 - text_left).max(40.0);
+        let tag = hit.playlist.then(|| {
+            p.layout_no_wrap(
+                s::PLAYLIST_TAG.to_uppercase(),
+                bold_font(10.5),
+                theme::accent_hover(),
+            )
+        });
+        let right_w = tag.as_ref().map_or(56.0, |g| g.size().x + 26.0);
+        let max_w = (dur_right - right_w - text_left).max(40.0);
         let title = one_line(ui, &hit.title, font(14.0), theme::TEXT, max_w);
         p.galley(
             pos2(text_left, rect.center().y - title.size().y - 1.0),
             title,
             theme::TEXT,
         );
-        if let Some(ch) = &hit.channel {
-            let ch = one_line(ui, ch, font(12.0), theme::TEXT_DIM, max_w);
-            p.galley(pos2(text_left, rect.center().y + 2.0), ch, theme::TEXT_DIM);
+        let sub = match (&hit.channel, hit.count) {
+            (Some(ch), Some(n)) => Some(format!("{} · {ch}", s::songs(n))),
+            (Some(ch), None) => Some(ch.clone()),
+            (None, Some(n)) => Some(s::songs(n)),
+            (None, None) => None,
+        };
+        if let Some(sub) = &sub {
+            let g = one_line(ui, sub, font(12.0), theme::TEXT_DIM, max_w);
+            p.galley(pos2(text_left, rect.center().y + 2.0), g, theme::TEXT_DIM);
         }
-        if hit.playlist {
-            let g = p.layout_no_wrap(
-                s::PLAYLIST_TAG.to_uppercase(),
-                bold_font(10.5),
-                theme::accent_hover(),
-            );
+        if let Some(g) = tag {
             let r = Rect::from_min_size(
                 pos2(dur_right - g.size().x - 14.0, rect.center().y - 10.0),
                 vec2(g.size().x + 14.0, 20.0),
@@ -1086,7 +1098,7 @@ impl App {
             ui.add_space(10.0);
             self.progress_ui(ui, view, track.as_ref());
             ui.add_space(4.0);
-            self.transport_ui(ui, room, track.is_some());
+            self.transport_ui(ui, view, room, track.is_some());
             if let Some(e) = &view.player_error {
                 ui.add_space(6.0);
                 error_box(ui, &format!("{e} {}", s::MISSING_TOOLS_PLAYBACK));
@@ -1193,10 +1205,37 @@ impl App {
         (shown, duration)
     }
 
-    fn transport_ui(&mut self, ui: &mut egui::Ui, room: &RoomState, has_track: bool) {
+    fn transport_ui(&mut self, ui: &mut egui::Ui, view: &View, room: &RoomState, has_track: bool) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             self.playback_buttons(ui, room, has_track, false);
+            // Shuffle sits with the playback controls, where people look for it.
+            let upcoming = room.queue.len() - room.playback.track_index.map_or(0, |i| i + 1);
+            if let Some(left) = view.shuffle_left {
+                let (r, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
+                ui.painter()
+                    .rect_filled(r, 8.0, theme::accent_alpha(36));
+                egui::Spinner::new()
+                    .color(theme::accent())
+                    .paint_at(ui, Rect::from_center_size(r.center(), vec2(16.0, 16.0)));
+                if resp
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(format!("{} ({left})", s::SHUFFLE_STOP))
+                    .clicked()
+                {
+                    self.send(Command::Shuffle);
+                }
+            } else if icons::ghost(
+                ui,
+                Icon::Shuffle,
+                36.0,
+                upcoming >= 2 && view.clear_left.is_none(),
+            )
+            .on_hover_text(s::SHUFFLE)
+            .clicked()
+            {
+                self.send(Command::Shuffle);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 ui.spacing_mut().slider_width = 110.0;
@@ -1343,6 +1382,21 @@ impl App {
                         .clicked()
                 {
                     self.scroll = current.map(Scroll::Index);
+                }
+                if let Some(left) = view.clear_left {
+                    let r = ui.add(egui::Spinner::new().size(16.0));
+                    if r.on_hover_text(format!("{} ({left})", s::CLEAR_STOP))
+                        .interact(Sense::click())
+                        .clicked()
+                    {
+                        self.send(Command::ClearQueue);
+                    }
+                } else if len > 0
+                    && icons::ghost(ui, Icon::Trash, 30.0, true)
+                        .on_hover_text(s::CLEAR_QUEUE)
+                        .clicked()
+                {
+                    self.confirm_clear = true;
                 }
                 if len > 0 {
                     if !self.filter.is_empty()
@@ -1960,6 +2014,60 @@ impl App {
         if close || resp.should_close() {
             self.settings_open = false;
             self.config.save();
+        }
+    }
+
+    /// Asks before the whole queue is removed for everyone.
+    fn confirm_clear_ui(&mut self, ctx: &egui::Context, view: &View) {
+        let len = view.room.as_ref().map_or(0, |r| r.queue.len());
+        if len == 0 {
+            self.confirm_clear = false;
+            return;
+        }
+        let (mut yes, mut no) = (false, false);
+        let resp = egui::Modal::new(Id::unique("confirm_clear_modal"))
+            .backdrop_color(Color32::from_black_alpha(150))
+            .frame(
+                card_frame()
+                    .inner_margin(Margin::same(22))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                ui.set_width((ctx.content_rect().width() - 80.0).clamp(220.0, 360.0));
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+                    icons::paint(ui.painter(), Icon::Trash, r.shrink(2.0), theme::accent());
+                    ui.label(
+                        RichText::new(s::CLEAR_TITLE)
+                            .font(bold_font(18.0))
+                            .color(theme::TEXT),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(s::clear_explain(len))
+                            .size(13.5)
+                            .color(theme::TEXT_DIM),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(16.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    yes = primary_button(ui, None, s::CLEAR_CONFIRM, vec2(120.0, 34.0), true)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked();
+                    no = ui
+                        .add(egui::Button::new(s::CANCEL).min_size(vec2(90.0, 34.0)))
+                        .clicked();
+                });
+            });
+        if yes {
+            self.send(Command::ClearQueue);
+        }
+        if yes || no || resp.should_close() {
+            self.confirm_clear = false;
         }
     }
 
@@ -2945,7 +3053,13 @@ impl eframe::App for App {
                 if self.settings_open && matches!(self.screen, Screen::Room) {
                     self.settings_ui(&ctx);
                 }
+                if self.confirm_clear && matches!(self.screen, Screen::Room) {
+                    self.confirm_clear_ui(&ctx, &view);
+                }
             }
+        }
+        if !matches!(self.screen, Screen::Room) {
+            self.confirm_clear = false;
         }
         if !matches!(self.screen, Screen::Room) && self.video_full {
             self.set_video_full(&ctx, false);
@@ -2953,7 +3067,8 @@ impl eframe::App for App {
         self.toasts_ui(&ctx, &view);
         // The native video area covers egui drawing: hide it under menus
         // and windows.
-        let covered = self.settings_open || egui::Popup::is_any_open(&ctx);
+        let covered =
+            self.settings_open || self.confirm_clear || egui::Popup::is_any_open(&ctx);
         let rect = self.video_rect.filter(|_| !covered);
         if let Some(h) = &mut self.video_host {
             h.place(rect, self.video_cut, ctx.pixels_per_point());
@@ -3024,6 +3139,15 @@ mod tests {
             s::VIDEO_TITLE,
             s::VIDEO_EXPLAIN,
             s::VIDEO_FULL_HINT,
+            s::SHUFFLE,
+            s::SHUFFLE_STOP,
+            s::SHUFFLED,
+            s::CLEAR_QUEUE,
+            s::CLEAR_STOP,
+            s::CLEAR_TITLE,
+            s::CLEAR_CONFIRM,
+            s::QUEUE_CLEARED,
+            &s::clear_explain(5),
             s::EXIT_FULLSCREEN,
             s::ON,
             s::OFF,

@@ -23,14 +23,6 @@ pub fn left(name: &str) -> String {
     format!("{name} je napustio/la sobu")
 }
 
-pub fn added_one(name: &str, title: &str) -> String {
-    format!("{name} je dodao/la: {title}")
-}
-
-pub fn added_many(name: &str, count: usize) -> String {
-    format!("{name} je dodao/la {count} pesama")
-}
-
 pub fn truncated(count: usize) -> String {
     format!("Red je pun, dodato je samo {count} pesama.")
 }

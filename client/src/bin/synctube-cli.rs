@@ -156,6 +156,8 @@ fn main() {
             ("play", []) => Command::Play,
             ("pause", []) => Command::Pause,
             ("next", []) => Command::Next,
+            ("shuffle", []) => Command::Shuffle,
+            ("clear", []) => Command::ClearQueue,
             ("prev", []) => Command::Previous,
             ("seek", [s]) => match s.parse::<f64>() {
                 Ok(s) => Command::Seek((s * 1000.0) as u64),
@@ -186,7 +188,10 @@ fn main() {
                         } else {
                             " "
                         };
-                        println!("{mark}{i:3} {} ({})", t.title, t.added_by);
+                        println!(
+                            "{mark}{i:3} {} {} {:?} ({})",
+                            t.youtube_id, t.title, t.duration_ms, t.added_by
+                        );
                     }
                 }
                 continue;

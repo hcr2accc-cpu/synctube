@@ -19,6 +19,8 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(45);
 const META_TIMEOUT: Duration = Duration::from_secs(120);
 const OEMBED_TIMEOUT: Duration = Duration::from_secs(5);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(40);
+const COUNTS_TIMEOUT: Duration = Duration::from_secs(8);
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 /// How many results a YouTube search returns.
 pub const SEARCH_RESULTS: usize = 20;
 /// Duration used for synthetic tracks in fake mode without yt-dlp.
@@ -51,6 +53,8 @@ pub struct SearchHit {
     pub playlist: bool,
     /// Video whose thumbnail stands for the hit.
     pub thumb_id: Option<String>,
+    /// Number of songs in a playlist, when YouTube tells.
+    pub count: Option<usize>,
 }
 
 impl SearchHit {
@@ -327,6 +331,7 @@ impl Resolver {
                     duration_ms: (!playlists).then_some(FAKE_DURATION_MS),
                     playlist: playlists,
                     thumb_id: None,
+                    count: playlists.then_some(3),
                 })
                 .collect());
         }
@@ -340,26 +345,35 @@ impl Resolver {
             format!("ytsearch{SEARCH_RESULTS}:{query}")
         };
         let end = SEARCH_RESULTS.to_string();
-        let json = self
-            .run(
-                &[
-                    "--flat-playlist",
-                    "-J",
-                    "--no-warnings",
-                    "--playlist-end",
-                    &end,
-                    &target,
-                ],
-                SEARCH_TIMEOUT,
-            )
-            .await?;
+        let args = [
+            "--flat-playlist",
+            "-J",
+            "--no-warnings",
+            "--playlist-end",
+            &end,
+            &target,
+        ];
+        // yt-dlp does not report how many songs a playlist has; the results
+        // page does, so it is read alongside (and only decorates the hits).
+        let counts = playlists.then(|| {
+            let url = format!("{target}&hl=en");
+            tokio::task::spawn_blocking(move || playlist_counts(&url))
+        });
+        let json = self.run(&args, SEARCH_TIMEOUT).await?;
         let v: Value =
             serde_json::from_str(&json).map_err(|_| strings::SEARCH_FAILED.to_string())?;
-        Ok(if playlists {
-            parse_playlist_search(&v)
-        } else {
-            parse_search(&v)
-        })
+        if !playlists {
+            return Ok(parse_search(&v));
+        }
+        let mut hits = parse_playlist_search(&v);
+        let counts = match counts {
+            Some(task) => task.await.unwrap_or_default(),
+            None => HashMap::new(),
+        };
+        for h in &mut hits {
+            h.count = counts.get(&h.youtube_id).copied();
+        }
+        Ok(hits)
     }
 
     /// `yt-dlp --version`.
@@ -418,6 +432,86 @@ fn url_works(url: &str) -> bool {
         .new_agent();
     let r = agent.get(url).header("Range", "bytes=0-1").call();
     !matches!(r, Err(ureq::Error::StatusCode(c)) if (400..500).contains(&c))
+}
+
+/// Song counts of the playlists on a YouTube results page, by playlist id.
+/// Empty when the page cannot be read.
+fn playlist_counts(url: &str) -> HashMap<String, usize> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(COUNTS_TIMEOUT))
+        .user_agent(BROWSER_UA)
+        .build()
+        .new_agent();
+    let body = agent
+        .get(url)
+        .header("Accept-Language", "en-US,en")
+        .header("Cookie", "SOCS=CAI")
+        .call()
+        .ok()
+        .and_then(|mut r| {
+            r.body_mut()
+                .with_config()
+                .limit(8 * 1024 * 1024)
+                .read_to_string()
+                .ok()
+        });
+    match body {
+        Some(html) => parse_playlist_counts(&html),
+        None => {
+            tracing::debug!("playlist counts: results page not readable");
+            HashMap::new()
+        }
+    }
+}
+
+/// Reads the "191 videos" badges out of a results page (English).
+pub fn parse_playlist_counts(html: &str) -> HashMap<String, usize> {
+    const START: &str = "ytInitialData = ";
+    fn count_in(v: &Value) -> Option<usize> {
+        match v {
+            Value::String(s) => {
+                let (n, unit) = s.split_once(' ')?;
+                if !matches!(
+                    unit,
+                    "video" | "videos" | "song" | "songs" | "episode" | "episodes"
+                ) {
+                    return None;
+                }
+                let digits: String = n.chars().filter(|c| !matches!(c, ',' | '.')).collect();
+                digits.parse().ok()
+            }
+            Value::Array(a) => a.iter().find_map(count_in),
+            Value::Object(o) => o.values().find_map(count_in),
+            _ => None,
+        }
+    }
+    fn walk(v: &Value, out: &mut HashMap<String, usize>) {
+        match v {
+            Value::Array(a) => a.iter().for_each(|v| walk(v, out)),
+            Value::Object(o) => {
+                if let Some(lockup) = o.get("lockupViewModel") {
+                    let id = lockup.get("contentId").and_then(Value::as_str);
+                    if let (Some(id), Some(n)) = (id, count_in(lockup)) {
+                        out.insert(id.to_string(), n);
+                    }
+                    return;
+                }
+                o.values().for_each(|v| walk(v, out));
+            }
+            _ => {}
+        }
+    }
+    let mut out = HashMap::new();
+    let Some(at) = html.find(START) else {
+        return out;
+    };
+    let first = serde_json::Deserializer::from_str(&html[at + START.len()..])
+        .into_iter::<Value>()
+        .next();
+    if let Some(Ok(data)) = first {
+        walk(&data, &mut out);
+    }
+    out
 }
 
 fn oembed_title(id: &str) -> Result<String, String> {
@@ -549,6 +643,7 @@ pub fn parse_search(v: &Value) -> Vec<SearchHit> {
                 duration_ms: duration_ms(e),
                 playlist: false,
                 thumb_id: Some(id.to_string()),
+                count: None,
             })
         })
         .collect()
@@ -589,6 +684,7 @@ pub fn parse_playlist_search(v: &Value) -> Vec<SearchHit> {
                 duration_ms: None,
                 playlist: true,
                 thumb_id,
+                count: None,
             })
         })
         .collect()
@@ -704,6 +800,17 @@ mod tests {
         assert!(hits[0]
             .url()
             .ends_with("list=PLToeUUa9hjL2FrcLwjcqOM5g69G3gqnpQ"));
+        assert_eq!(hits[0].count, None);
+        let html = r#"<script>var ytInitialData = {"contents":[
+            {"lockupViewModel":{"contentImage":{"badge":{"text":"1,191 videos"}},
+              "contentId":"PLToeUUa9hjL2FrcLwjcqOM5g69G3gqnpQ"}},
+            {"lockupViewModel":{"contentId":"PLnocount","metadata":{"text":"2 days ago"}}},
+            {"lockupViewModel":{"contentId":"PLone","x":[{"text":"1 video"}]}}]};</script>"#;
+        let counts = parse_playlist_counts(html);
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts["PLToeUUa9hjL2FrcLwjcqOM5g69G3gqnpQ"], 1191);
+        assert_eq!(counts["PLone"], 1);
+        assert!(parse_playlist_counts("nothing here").is_empty());
         assert_eq!(url_encode("ceca & 2026"), "ceca+%26+2026");
         assert_eq!(url_encode("đ"), "%C4%91");
     }

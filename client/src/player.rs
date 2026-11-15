@@ -55,16 +55,6 @@ impl Player {
         }
     }
 
-    /// Adds a video track to the song that is playing (opened in the
-    /// background, so playback does not stall).
-    pub async fn add_video(&self, url: &str) {
-        if let Player::Mpv(m) = self {
-            if let Err(e) = m.command_async(json!(["video-add", url, "select"])).await {
-                tracing::warn!("cannot add video: {e}");
-            }
-        }
-    }
-
     /// Replaces the audio filter chain ("" removes it).
     pub async fn set_af(&self, af: &str) {
         if let Player::Mpv(m) = self {

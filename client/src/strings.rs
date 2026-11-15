@@ -114,6 +114,14 @@ pub const NOTHING_PLAYING_HINT: &str = "Potraži pesmu ili nalepi YouTube link i
 pub const PASTE_HINT: &str =
     "Enter dodaje link ili traži · Ctrl+V bilo gde u prozoru odmah dodaje link · Razmak pušta/pauzira";
 pub const SEARCH_QUEUE: &str = "Pretraži red…";
+pub const SHUFFLE: &str = "Izmešaj pesme koje tek dolaze";
+pub const SHUFFLE_STOP: &str = "Mešanje u toku — klik za prekid";
+pub const SHUFFLED: &str = "Pesme koje tek dolaze su izmešane";
+pub const CLEAR_QUEUE: &str = "Obriši sve pesme iz sobe";
+pub const CLEAR_STOP: &str = "Brisanje u toku — klik za prekid";
+pub const CLEAR_TITLE: &str = "Obrisati ceo red?";
+pub const CLEAR_CONFIRM: &str = "Obriši sve";
+pub const QUEUE_CLEARED: &str = "Red je obrisan";
 pub const JUMP_TO_CURRENT: &str = "Idi na trenutnu pesmu";
 pub const PLAY_NEXT: &str = "Pusti posle trenutne";
 pub const DOUBLE_CLICK_HINT: &str = "prevuci za redosled · klik na sliku pušta";
@@ -179,6 +187,13 @@ pub fn songs(n: usize) -> String {
         "pesama"
     };
     format!("{n} {word}")
+}
+
+pub fn clear_explain(n: usize) -> String {
+    format!(
+        "{} će biti uklonjeno iz reda za sve u sobi i muzika će stati. Ovo ne može da se poništi.",
+        songs(n)
+    )
 }
 
 pub fn members_title(n: usize) -> String {

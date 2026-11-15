@@ -22,6 +22,8 @@ pub enum Icon {
     PlayNext,
     Gear,
     ExitFullscreen,
+    Shuffle,
+    Trash,
 }
 
 /// A framed button showing `icon`, `size` points square.
@@ -361,6 +363,47 @@ pub fn paint(painter: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
                 let c = pos2(cx0, cy0);
                 painter.line_segment([c, pos2(cx0 + sx * k, cy0)], stroke);
                 painter.line_segment([c, pos2(cx0, cy0 + sy * k)], stroke);
+            }
+        }
+        Icon::Shuffle => {
+            // Two crossing lines, arrowheads on the right.
+            let (y0, y1) = (t + w * 0.18, b - w * 0.18);
+            let x1 = rt - w * 0.06;
+            painter.line_segment([pos2(l, y1), pos2(x1, y0)], stroke);
+            painter.line_segment(
+                [pos2(l, y0), pos2(l + w * 0.32, y0 + (y1 - y0) * 0.32)],
+                stroke,
+            );
+            painter.line_segment(
+                [pos2(rt - w * 0.42, y1 - (y1 - y0) * 0.32), pos2(x1, y1)],
+                stroke,
+            );
+            let a = w * 0.26;
+            for y in [y0, y1] {
+                tri(
+                    painter,
+                    [
+                        pos2(rt, y),
+                        pos2(rt - a, y - a * 0.6),
+                        pos2(rt - a, y + a * 0.6),
+                    ],
+                    color,
+                );
+            }
+        }
+        Icon::Trash => {
+            let thin = Stroke::new((w * 0.11).max(1.4), color);
+            let lid = t + w * 0.22;
+            painter.line_segment([pos2(l, lid), pos2(rt, lid)], thin);
+            painter.line_segment([pos2(cx - w * 0.16, t), pos2(cx + w * 0.16, t)], thin);
+            painter.line_segment([pos2(cx - w * 0.16, t), pos2(cx - w * 0.16, lid)], thin);
+            painter.line_segment([pos2(cx + w * 0.16, t), pos2(cx + w * 0.16, lid)], thin);
+            let (bl, br) = (l + w * 0.14, rt - w * 0.14);
+            painter.line_segment([pos2(bl, lid), pos2(bl + w * 0.06, b)], thin);
+            painter.line_segment([pos2(br, lid), pos2(br - w * 0.06, b)], thin);
+            painter.line_segment([pos2(bl + w * 0.06, b), pos2(br - w * 0.06, b)], thin);
+            for x in [cx - w * 0.13, cx + w * 0.13] {
+                painter.line_segment([pos2(x, lid + w * 0.2), pos2(x, b - w * 0.16)], thin);
             }
         }
         Icon::Volume | Icon::Mute => {

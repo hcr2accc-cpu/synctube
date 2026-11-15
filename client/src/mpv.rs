@@ -102,6 +102,13 @@ impl Mpv {
         if let Some(conf) = input_conf() {
             cmd.arg(format!("--input-conf={}", conf.display()));
         }
+        // Troubleshooting: SYNCTUBE_MPV_LOG=<file> makes mpv write its log
+        // (one file per start of the player: <file>.1, <file>.2, ...).
+        if let Some(log) = std::env::var_os("SYNCTUBE_MPV_LOG") {
+            static STARTS: AtomicU64 = AtomicU64::new(1);
+            let n = STARTS.fetch_add(1, Ordering::Relaxed);
+            cmd.arg(format!("--log-file={}.{n}", log.to_string_lossy()));
+        }
         if !opts.af.is_empty() {
             cmd.arg(format!("--af={}", opts.af));
         }
@@ -160,20 +167,6 @@ impl Mpv {
             .map(|_| ())
     }
 
-    /// Sends a command that mpv runs in the background (e.g. opening a
-    /// stream); does not wait for it.
-    pub async fn command_async(&self, args: Value) -> Result<(), String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut line =
-            serde_json::to_vec(&json!({ "command": args, "request_id": id, "async": true }))
-                .map_err(|e| e.to_string())?;
-        line.push(b'\n');
-        let mut w = self.writer.lock().await;
-        w.write_all(&line)
-            .await
-            .map_err(|e| format!("mpv ipc: {e}"))
-    }
-
     pub async fn get_f64(&self, name: &str) -> Option<f64> {
         self.command(json!(["get_property", name]))
             .await
@@ -198,7 +191,16 @@ impl Mpv {
             tracing::warn!("cannot set the video track: {e}");
         }
         let _ = self.set_property("force-media-title", json!(title)).await;
-        let r = self.command(json!(["loadfile", url, "replace"])).await?;
+        // The video track is picked per file: a `vid` set while a song
+        // without a picture was playing does not carry over to the next one.
+        let opts = if video.is_some() {
+            json!({ "vid": "1" })
+        } else {
+            json!({})
+        };
+        let r = self
+            .command(json!(["loadfile", url, "replace", -1, opts]))
+            .await?;
         Ok(r.get("playlist_entry_id")
             .and_then(Value::as_u64)
             .unwrap_or(0))
@@ -240,7 +242,11 @@ fn input_conf() -> Option<std::path::PathBuf> {
 
 #[cfg(windows)]
 fn ipc_name() -> String {
-    format!(r"\\.\pipe\synctube-{}", std::process::id())
+    // A new name for every start: a player that crashed can keep its old
+    // pipe open for a while, and the next one must not connect to that.
+    static STARTS: AtomicU64 = AtomicU64::new(0);
+    let n = STARTS.fetch_add(1, Ordering::Relaxed);
+    format!(r"\\.\pipe\synctube-{}-{n}", std::process::id())
 }
 
 /// A socket path in the temp dir; a stale one from a crashed mpv is removed.

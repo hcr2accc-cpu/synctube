@@ -645,17 +645,11 @@ impl Room {
         }
         let first_new = self.queue.len();
         let count = new.len();
-        let first_title = new[0].title.clone();
         self.queue.extend(new);
         self.touch();
         if count < total_valid {
             self.error(conn, &strings::truncated(count));
         }
-        self.toast_all(if count == 1 {
-            strings::added_one(&added_by, &first_title)
-        } else {
-            strings::added_many(&added_by, count)
-        });
         if self.playback.status == PlayStatus::Stopped {
             self.start_track(first_new);
         }
