@@ -30,6 +30,9 @@ pub fn instant_at_local_ms(ms: u64) -> Instant {
 
 /// Number of samples kept for the estimate.
 const WINDOW: usize = 16;
+/// In the low-latency mode pings are constant, so more fit in the window
+/// (about 10 s of them); the best few of many are steadier.
+const WINDOW_LOW: usize = 40;
 
 /// Collects ping samples and keeps the current offset estimate.
 #[derive(Debug, Default)]
@@ -37,11 +40,19 @@ pub struct ClockSync {
     samples: Vec<ClockSample>,
     estimate: Option<ClockEstimate>,
     rough_offset: Option<i64>,
+    low_latency: bool,
 }
 
 impl ClockSync {
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            low_latency: self.low_latency,
+            ..Self::default()
+        };
+    }
+
+    pub fn set_low_latency(&mut self, on: bool) {
+        self.low_latency = on;
     }
 
     /// Rough offset from the `Welcome` message (used until pongs arrive).
@@ -49,15 +60,18 @@ impl ClockSync {
         self.rough_offset = Some(server_ms as i64 - local_ms() as i64);
     }
 
-    pub fn add_sample(&mut self, client_send_ms: u64, server_ms: u64) {
+    /// `client_recv_ms` is when the pong arrived (stamped by the network
+    /// task, so a busy engine doesn't make the round trip look longer).
+    pub fn add_sample(&mut self, client_send_ms: u64, server_ms: u64, client_recv_ms: u64) {
         let s = ClockSample {
             client_send_ms,
             server_ms,
-            client_recv_ms: local_ms(),
+            client_recv_ms,
         };
         self.samples.push(s);
-        if self.samples.len() > WINDOW {
-            let drop = self.samples.len() - WINDOW;
+        let window = if self.low_latency { WINDOW_LOW } else { WINDOW };
+        if self.samples.len() > window {
+            let drop = self.samples.len() - window;
             self.samples.drain(..drop);
         }
         self.estimate = estimate_clock_offset(&self.samples);

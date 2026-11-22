@@ -7,7 +7,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use shared::sync::{decide_drift, expected_position_clamped, to_server_ms, DriftAction};
+use shared::sync::{
+    decide_drift, decide_drift_low, expected_position_clamped, to_server_ms, DriftAction,
+};
 use shared::{ClientMsg, Member, MemberSync, PlayStatus, RoomState, ServerMsg, TrackInfo};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -38,6 +40,12 @@ pub struct EngineConfig {
     pub video: bool,
     /// Native window inside the app that the video is drawn into.
     pub video_wid: Option<i64>,
+    /// Low-latency mode: constant clock pings, a drift check 5 times a
+    /// second and correction of even a few milliseconds of drift.
+    pub low_latency: bool,
+    /// How late this device's sound comes out (Bluetooth headphones,
+    /// speakers); the player runs that much ahead to make up for it.
+    pub audio_offset_ms: i64,
 }
 
 /// Commands from the UI.
@@ -77,6 +85,8 @@ pub enum Command {
     SetNormalize(bool),
     SetEq(crate::eq::EqSettings),
     SetVideo(bool),
+    SetLowLatency(bool),
+    SetAudioOffset(i64),
     SetTools(Tools),
     Shutdown,
 }
@@ -174,6 +184,8 @@ pub struct View {
     pub phase: Phase,
     pub drift_ms: Option<i64>,
     pub speed: f64,
+    /// The low-latency mode is on.
+    pub low_latency: bool,
     pub player_pos_ms: Option<u64>,
     pub pending_adds: Vec<PendingAdd>,
     pub search: SearchView,
@@ -349,6 +361,10 @@ const PING_BURST: u8 = 8;
 const PING_SPACING: Duration = Duration::from_millis(100);
 const RESYNC_EVERY: Duration = Duration::from_secs(30);
 const DRIFT_EVERY: Duration = Duration::from_secs(1);
+/// Low-latency mode: one clock ping this often, all the time.
+const LOW_PING_EVERY: Duration = Duration::from_millis(250);
+/// Low-latency mode: drift check this often.
+const LOW_DRIFT_EVERY: Duration = Duration::from_millis(200);
 /// At most this often while only the drift number changes.
 const STATUS_MIN_GAP: Duration = Duration::from_millis(400);
 /// Wake up this much before a scheduled unpause and spin the rest (Windows
@@ -483,6 +499,8 @@ impl Engine {
         let (player_tx, player_rx) = mpsc::unbounded_channel();
         let (task_tx, task_rx) = mpsc::unbounded_channel();
         let view = shared.lock().unwrap().clone();
+        let mut clock = ClockSync::default();
+        clock.set_low_latency(cfg.low_latency);
         Self {
             resolver: Resolver::new(cfg.tools.yt_dlp.clone(), cfg.fake_audio),
             cfg,
@@ -498,7 +516,7 @@ impl Engine {
             player_restarts: 0,
             task_tx,
             task_rx,
-            clock: ClockSync::default(),
+            clock,
             room: None,
             cur: None,
             applied_version: None,
@@ -592,6 +610,7 @@ impl Engine {
         self.view.clock_synced = self.clock.is_synced();
         self.view.phase = self.phase();
         self.view.speed = self.cur.as_ref().map_or(1.0, |c| c.speed);
+        self.view.low_latency = self.cfg.low_latency;
         self.view.shuffle_left = self.shuffle.as_ref().map(|s| s.order.len() - s.done);
         self.view.clear_left = self.clear.as_ref().map(|c| c.ids.len() - c.done);
         self.report_status();
@@ -646,8 +665,16 @@ impl Engine {
         let mut now = self.view.sync();
         // Drift inside the tolerance is "in sync"; beyond it, coarse steps
         // are enough for a dot on a screen.
+        let low = self.cfg.low_latency;
         now.drift_ms = now.drift_ms.map(|d| {
-            if (d as i64).abs() <= shared::sync::DRIFT_IGNORE_MS {
+            if low {
+                // Exact, so the room sees the difference the mode makes.
+                if (d as i64).abs() <= shared::sync::LOW_DEADBAND_MS {
+                    0
+                } else {
+                    d
+                }
+            } else if (d as i64).abs() <= shared::sync::DRIFT_IGNORE_MS {
                 0
             } else {
                 d / 20 * 20
@@ -767,6 +794,26 @@ impl Engine {
             }
             Command::SetEq(eq) => self.set_eq(eq.clamped()).await,
             Command::SetVideo(on) => self.set_video(on).await,
+            Command::SetLowLatency(on) => {
+                self.cfg.low_latency = on;
+                self.clock.set_low_latency(on);
+                if self.net.is_some() {
+                    self.pings_left = 0;
+                    self.next_ping = Some(Instant::now());
+                }
+                if self.next_drift.is_some() {
+                    self.schedule_drift();
+                }
+                if !on {
+                    self.set_speed(1.0).await;
+                }
+            }
+            Command::SetAudioOffset(ms) => {
+                self.cfg.audio_offset_ms = ms.clamp(-500, 500);
+                if self.next_drift.is_some() {
+                    self.schedule_drift();
+                }
+            }
             Command::SetTools(tools) => {
                 let had_ytdlp = self.cfg.tools.yt_dlp.is_some();
                 self.resolver.set_path(tools.yt_dlp.clone());
@@ -855,6 +902,11 @@ impl Engine {
                 self.view.conn = ConnState::Failed(strings::SERVER_UNREACHABLE.into());
             }
             NetEvent::Msg(m) => self.on_server(m).await,
+            NetEvent::Pong {
+                client_ms,
+                server_ms,
+                recv_ms,
+            } => self.clock.add_sample(client_ms, server_ms, recv_ms),
         }
     }
 
@@ -906,7 +958,7 @@ impl Engine {
                 server_ms,
             } => {
                 let before = self.clock.offset_ms();
-                self.clock.add_sample(client_ms, server_ms);
+                self.clock.add_sample(client_ms, server_ms, local_ms());
                 let after = self.clock.offset_ms();
                 if (after - before).abs() > 30 {
                     tracing::debug!(before, after, "clock offset changed");
@@ -952,6 +1004,13 @@ impl Engine {
     }
 
     fn ping_tick(&mut self) {
+        if self.cfg.low_latency {
+            self.send(ClientMsg::Ping {
+                client_ms: local_ms(),
+            });
+            self.next_ping = Some(Instant::now() + LOW_PING_EVERY);
+            return;
+        }
         if self.pings_left == 0 {
             self.pings_left = PING_BURST;
         }
@@ -1925,14 +1984,20 @@ impl Engine {
         let Some((pos, at_local)) = self.position().await else {
             return;
         };
-        let server_at = to_server_ms(at_local, self.clock.offset_ms()) as i64;
+        let server_at = self.timeline_at(at_local) as i64;
         let reach = pb.anchor_server_ms as i64 + (pos as i64 - pb.anchor_position_ms as i64);
         let wait = reach - server_at;
         let paused = self.cur.as_ref().is_none_or(|c| c.paused);
         tracing::debug!(pos, wait, paused, "align");
+        // Within these the drift check fixes it with the speed (no pause/seek).
+        let (ahead_ok, behind_ok) = if self.cfg.low_latency {
+            (shared::sync::LOW_SEEK_MS, shared::sync::LOW_SEEK_MS)
+        } else {
+            (shared::sync::DRIFT_IGNORE_MS, shared::sync::DRIFT_SEEK_MS)
+        };
         if (0..=MAX_WAIT_MS).contains(&wait) {
             if !paused {
-                if wait <= shared::sync::DRIFT_IGNORE_MS {
+                if wait <= ahead_ok {
                     self.schedule_drift();
                     return;
                 }
@@ -1944,7 +2009,7 @@ impl Engine {
             } else {
                 self.unpause_at = Some(instant_at_local_ms(at_local + wait as u64));
             }
-        } else if wait < 0 && -wait <= shared::sync::DRIFT_SEEK_MS {
+        } else if wait < 0 && -wait <= behind_ok {
             if paused {
                 self.unpause_now().await;
             } else {
@@ -1957,7 +2022,7 @@ impl Engine {
                 self.unpause_now().await;
                 return;
             }
-            let now = self.server_now();
+            let now = self.timeline_at(local_ms());
             let target = if now < pb.anchor_server_ms {
                 pb.anchor_position_ms
             } else {
@@ -1990,7 +2055,19 @@ impl Engine {
     }
 
     fn schedule_drift(&mut self) {
-        self.next_drift = Some(Instant::now() + DRIFT_EVERY);
+        let every = if self.cfg.low_latency {
+            LOW_DRIFT_EVERY
+        } else {
+            DRIFT_EVERY
+        };
+        self.next_drift = Some(Instant::now() + every);
+    }
+
+    /// The room's timeline at a local time, as this device should be
+    /// playing it: shifted by how late its sound comes out.
+    fn timeline_at(&self, at_local: u64) -> u64 {
+        let t = to_server_ms(at_local, self.clock.offset_ms()) as i64 + self.cfg.audio_offset_ms;
+        t.max(0) as u64
     }
 
     async fn drift_check(&mut self) {
@@ -2012,7 +2089,7 @@ impl Engine {
             self.schedule_drift();
             return;
         };
-        let server_at = to_server_ms(at_local, self.clock.offset_ms());
+        let server_at = self.timeline_at(at_local);
         if server_at < pb.anchor_server_ms {
             self.schedule_drift();
             return;
@@ -2027,7 +2104,12 @@ impl Engine {
         self.view.drift_ms = Some(drift);
         self.view.player_pos_ms = Some(pos);
         let speed = self.cur.as_ref().map_or(1.0, |c| c.speed);
-        match decide_drift(drift, speed) {
+        let action = if self.cfg.low_latency {
+            decide_drift_low(drift)
+        } else {
+            decide_drift(drift, speed)
+        };
+        match action {
             DriftAction::None => self.schedule_drift(),
             DriftAction::SetSpeed(s) => {
                 tracing::debug!(drift, speed = s, "nudging speed");

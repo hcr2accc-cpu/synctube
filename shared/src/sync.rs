@@ -157,6 +157,34 @@ pub fn decide_drift(drift_ms: i64, current_speed: f64) -> DriftAction {
     }
 }
 
+/// Low-latency mode: drift below this counts as zero (measurement noise).
+pub const LOW_DEADBAND_MS: i64 = 3;
+/// Low-latency mode: above this drift a hard seek is performed.
+pub const LOW_SEEK_MS: i64 = 300;
+/// Low-latency mode: the speed change removes the drift in about this long.
+pub const LOW_CORRECT_MS: f64 = 1000.0;
+/// Low-latency mode: the largest speed change (4 %).
+pub const LOW_MAX_DEVIATION: f64 = 0.04;
+
+/// Drift correction for the low-latency mode: the speed is set in
+/// proportion to the drift on every check, so even a few milliseconds are
+/// corrected, smoothly, instead of being ignored below 50 ms.
+///
+/// `drift_ms` is `actual - expected` (positive = this client is ahead).
+pub fn decide_drift_low(drift_ms: i64) -> DriftAction {
+    let abs = drift_ms.abs();
+    if abs > LOW_SEEK_MS {
+        return DriftAction::Seek;
+    }
+    if abs <= LOW_DEADBAND_MS {
+        return DriftAction::SetSpeed(1.0);
+    }
+    let dev = (drift_ms as f64 / LOW_CORRECT_MS).clamp(-LOW_MAX_DEVIATION, LOW_MAX_DEVIATION);
+    // Rounded, so noise of a fraction of a millisecond doesn't change the speed.
+    let speed = ((1.0 - dev) * 1000.0).round() / 1000.0;
+    DriftAction::SetSpeed(speed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +332,18 @@ mod tests {
             decide_drift(300, SPEED_FAST),
             DriftAction::SetSpeed(SPEED_SLOW)
         );
+    }
+    #[test]
+    fn low_latency_corrects_small_drift() {
+        assert_eq!(decide_drift_low(0), DriftAction::SetSpeed(1.0));
+        assert_eq!(decide_drift_low(-3), DriftAction::SetSpeed(1.0));
+        // 10 ms behind: 1 % faster; 20 ms ahead: 2 % slower.
+        assert_eq!(decide_drift_low(-10), DriftAction::SetSpeed(1.01));
+        assert_eq!(decide_drift_low(20), DriftAction::SetSpeed(0.98));
+        // Capped at 4 %.
+        assert_eq!(decide_drift_low(-250), DriftAction::SetSpeed(1.04));
+        assert_eq!(decide_drift_low(250), DriftAction::SetSpeed(0.96));
+        assert_eq!(decide_drift_low(301), DriftAction::Seek);
+        assert_eq!(decide_drift_low(-301), DriftAction::Seek);
     }
 }

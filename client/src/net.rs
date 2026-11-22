@@ -28,6 +28,12 @@ pub enum NetEvent {
     /// Connected and `Join` sent.
     Connected,
     Msg(ServerMsg),
+    /// A pong, with the local time it arrived.
+    Pong {
+        client_ms: u64,
+        server_ms: u64,
+        recv_ms: u64,
+    },
     /// Connection lost; retrying after `retry_in`.
     Disconnected {
         retry_in: Duration,
@@ -164,7 +170,7 @@ where
         tokio::select! {
             frame = tokio::time::timeout(READ_TIMEOUT, stream.next()) => {
                 let frame = match frame {
-                    Ok(Some(Ok(f))) => f,
+                    Ok(Some(Ok(f))) => (f, crate::clock::local_ms()),
                     Ok(Some(Err(e))) => {
                         tracing::info!("websocket error: {e}");
                         return SessionEnd::Lost;
@@ -175,8 +181,12 @@ where
                         return SessionEnd::Lost;
                     }
                 };
+                let (frame, recv_ms) = frame;
                 match frame {
                     Message::Text(t) => match serde_json::from_str::<ServerMsg>(t.as_str()) {
+                        Ok(ServerMsg::Pong { client_ms, server_ms }) => {
+                            let _ = events.send(NetEvent::Pong { client_ms, server_ms, recv_ms });
+                        }
                         Ok(ServerMsg::Rejected { message }) => {
                             let _ = events.send(NetEvent::Rejected(message));
                             return SessionEnd::Stop;

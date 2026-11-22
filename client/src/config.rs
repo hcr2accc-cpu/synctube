@@ -30,6 +30,10 @@ pub struct Config {
     pub eq: crate::eq::EqSettings,
     /// Show the music video in its own window.
     pub video: bool,
+    /// Low-latency sync mode (tighter, more work, more network).
+    pub low_latency: bool,
+    /// How late this device's sound comes out, in ms.
+    pub audio_offset_ms: i64,
 }
 
 /// How many recent rooms are remembered.
@@ -75,6 +79,8 @@ impl Default for Config {
             search_playlists: false,
             eq: crate::eq::EqSettings::default(),
             video: false,
+            low_latency: false,
+            audio_offset_ms: 0,
         }
     }
 }

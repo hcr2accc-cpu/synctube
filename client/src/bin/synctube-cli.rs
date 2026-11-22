@@ -24,6 +24,8 @@ struct Args {
     volume: f64,
     normalize: bool,
     status_every: Option<f64>,
+    low_latency: bool,
+    audio_offset_ms: i64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -38,6 +40,8 @@ fn parse_args() -> Result<Args, String> {
         volume: 70.0,
         normalize: false,
         status_every: Some(2.0),
+        low_latency: false,
+        audio_offset_ms: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -51,6 +55,10 @@ fn parse_args() -> Result<Args, String> {
             "--fake-rate" => a.fake_rate = val()?.parse().map_err(|_| "bad --fake-rate")?,
             "--no-update" => a.no_update = true,
             "--normalize" => a.normalize = true,
+            "--low-latency" => a.low_latency = true,
+            "--audio-offset" => {
+                a.audio_offset_ms = val()?.parse().map_err(|_| "bad --audio-offset")?
+            }
             "--volume" => a.volume = val()?.parse().map_err(|_| "bad --volume")?,
             "--status-every" => {
                 let s: f64 = val()?.parse().map_err(|_| "bad --status-every")?;
@@ -59,7 +67,7 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => {
                 println!(
                     "synctube-cli --server URL --room ROOM --name NAME [--password P] \
-                     [--fake-audio] [--fake-rate R] [--no-update] [--normalize] [--volume 0-100] [--status-every SECS]"
+                     [--fake-audio] [--fake-rate R] [--no-update] [--normalize] [--low-latency] [--audio-offset MS] [--volume 0-100] [--status-every SECS]"
                 );
                 std::process::exit(0);
             }
@@ -75,7 +83,7 @@ fn status_line(v: &View) -> String {
     let pos = v.position_ms().map_or("-".into(), fmt_ms);
     let player = v.player_pos_ms.map_or("-".into(), fmt_ms);
     format!(
-        "[{:?}] {:?} status={:?} track={} pos={} player={} drift={} speed={:.2} rtt={} offset={} queue={} members={}",
+        "[{:?}] {:?} status={:?} track={} pos={} player={} drift={} speed={:.3} rtt={} offset={} queue={} members={}",
         v.conn,
         v.phase,
         room.map(|r| r.playback.status),
@@ -115,6 +123,8 @@ fn main() {
         eq: client::eq::EqSettings::default(),
         video: false,
         video_wid: None,
+        low_latency: args.low_latency,
+        audio_offset_ms: args.audio_offset_ms,
     };
     let handle = engine::start(cfg, Arc::new(|| {}));
     handle.send(Command::Connect {

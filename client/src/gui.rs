@@ -132,6 +132,8 @@ impl App {
                 eq: config.eq.clone().clamped(),
                 video: config.video,
                 video_wid: video_host.as_ref().map(|h| h.wid()),
+                low_latency: config.low_latency,
+                audio_offset_ms: config.audio_offset_ms.clamp(-500, 500),
             },
             notify.clone(),
         );
@@ -2009,12 +2011,75 @@ impl App {
                             )
                             .wrap(),
                         );
+                        ui.add_space(18.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+                        self.latency_ui(ui);
                     });
             });
         if close || resp.should_close() {
             self.settings_open = false;
             self.config.save();
         }
+    }
+
+    /// Low-latency switch and the per-device sound delay.
+    fn latency_ui(&mut self, ui: &mut egui::Ui) {
+        section_label(ui, s::LOW_LATENCY_TITLE);
+        ui.add_space(6.0);
+        let on = self.config.low_latency;
+        if toggle_pill(ui, if on { s::ON } else { s::OFF }, on).clicked() {
+            self.config.low_latency = !on;
+            self.config.save();
+            self.send(Command::SetLowLatency(!on));
+        }
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(s::LOW_LATENCY_EXPLAIN)
+                    .size(12.5)
+                    .color(theme::TEXT_DIM),
+            )
+            .wrap(),
+        );
+        ui.add_space(14.0);
+        section_label(ui, s::AUDIO_OFFSET_TITLE);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(120.0);
+            let mut v = self.config.audio_offset_ms as f64;
+            let r = ui.add(
+                egui::Slider::new(&mut v, -300.0..=300.0)
+                    .show_value(false)
+                    .step_by(5.0),
+            );
+            let r = r.on_hover_text(s::AUDIO_OFFSET_EXPLAIN);
+            if r.double_clicked() {
+                v = 0.0;
+            }
+            let ms = v.round() as i64;
+            if ms != self.config.audio_offset_ms {
+                self.config.audio_offset_ms = ms;
+                self.send(Command::SetAudioOffset(ms));
+            }
+            if r.drag_stopped() || r.double_clicked() {
+                self.config.save();
+            }
+            ui.label(
+                RichText::new(s::offset(self.config.audio_offset_ms))
+                    .size(12.5)
+                    .color(theme::TEXT),
+            );
+        });
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(s::AUDIO_OFFSET_EXPLAIN)
+                    .size(12.5)
+                    .color(theme::TEXT_DIM),
+            )
+            .wrap(),
+        );
     }
 
     /// Asks before the whole queue is removed for everyone.
@@ -2943,6 +3008,7 @@ fn status(view: &View) -> (String, Color32) {
         Phase::Paused => (s::PHASE_PAUSED.into(), theme::TEXT_DIM),
         Phase::Playing => match view.drift_ms {
             Some(d) if d.abs() > shared::sync::DRIFT_IGNORE_MS => (s::SYNCING.into(), theme::WARN),
+            Some(d) if view.low_latency => (s::synced_ms(d), theme::GOOD),
             _ => (s::SYNCED.into(), theme::GOOD),
         },
         Phase::Error(e) => (e.clone(), theme::BAD),
@@ -3138,6 +3204,12 @@ mod tests {
             s::EQ_CUSTOM,
             s::VIDEO_TITLE,
             s::VIDEO_EXPLAIN,
+            s::LOW_LATENCY_TITLE,
+            s::LOW_LATENCY_EXPLAIN,
+            s::AUDIO_OFFSET_TITLE,
+            s::AUDIO_OFFSET_EXPLAIN,
+            &s::synced_ms(-4),
+            &s::offset(-120),
             s::VIDEO_FULL_HINT,
             s::SHUFFLE,
             s::SHUFFLE_STOP,

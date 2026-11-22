@@ -1,0 +1,115 @@
+// All user-facing strings (Serbian, Latin script). Change them here.
+package rs.synctube
+
+object S {
+    const val APP_TITLE = "SyncTube"
+
+    // Connect screen
+    const val CONNECT_HEADING = "Poveži se sa ekipom"
+    const val SERVER_URL = "Adresa servera"
+    const val SERVER_URL_HINT = "wss://…onrender.com/ws"
+    const val ROOM = "Soba"
+    const val ROOM_HINT = "npr. ekipa"
+    const val PASSWORD = "Lozinka (opciono)"
+    const val NICKNAME = "Nadimak"
+    const val NICK_HINT = "kako da te zovu"
+    const val CONNECT = "Poveži se"
+    const val CANCEL = "Otkaži"
+    const val ADVANCED = "Napredno"
+    const val FILL_ALL = "Popuni adresu servera, sobu i nadimak."
+    const val BAD_SERVER_URL = "Adresa servera mora početi sa ws:// ili wss://"
+    const val RECENT_ROOMS = "Nedavne sobe"
+
+    // Connection status
+    const val CONNECTING = "Povezivanje…"
+    const val WAKING_SERVER = "Budim server… (prvo povezivanje može trajati do minut)"
+    const val CONNECTED = "Povezano"
+    const val SERVER_UNREACHABLE = "Server nije dostupan. Proveri adresu i pokušaj ponovo."
+    fun reconnectingIn(secs: Long) = "Veza je prekinuta, ponovno povezivanje za $secs s…"
+
+    // Room screen
+    const val LEAVE = "Izađi"
+    const val NOTHING_PLAYING_TITLE = "Ništa ne svira"
+    const val NOTHING_PLAYING_HINT = "Potraži pesmu ili nalepi YouTube link ispod."
+    const val PASTE_LINK = "Nalepi YouTube link ili ukucaj šta tražiš"
+    const val SEARCH_TITLE = "Pretraga"
+    const val BACK_TO_QUEUE = "Nazad na red"
+    const val SEARCHING = "Tražim na YouTube-u…"
+    const val SEARCH_NOTHING = "Ništa nije pronađeno."
+    const val SEARCH_SONGS = "Pesme"
+    const val SEARCH_PLAYLISTS = "Plejliste"
+    const val PLAYLIST_TAG = "plejlista"
+    const val ADDING = "Učitavam link…"
+    const val QUEUE = "Red pesama"
+    const val QUEUE_EMPTY_TITLE = "Red je prazan"
+    const val QUEUE_EMPTY_HINT = "Potraži pesmu ili nalepi YouTube link iznad."
+    const val MEMBERS = "U sobi"
+    const val VOLUME = "Jačina"
+    const val ADDED_BY = "dodao/la"
+    const val REMOVE = "Ukloni iz reda"
+    const val MOVE_UP = "Pomeri gore"
+    const val MOVE_DOWN = "Pomeri dole"
+    const val PLAY_THIS = "Pusti ovu pesmu"
+    const val PLAY_NEXT = "Pusti posle trenutne"
+    const val YOU = "(ti)"
+    const val SHUFFLE = "Izmešaj pesme koje tek dolaze"
+    const val SHUFFLED = "Pesme koje tek dolaze su izmešane"
+    const val CLEAR_QUEUE = "Obriši sve pesme iz sobe"
+    const val CLEAR_TITLE = "Obrisati ceo red?"
+    const val CLEAR_CONFIRM = "Obriši sve"
+    const val QUEUE_CLEARED = "Red je obrisan"
+    const val ABOUT = "Napravljeno za ekipu, 2026."
+
+    // Playback/sync status
+    const val PHASE_RESOLVING = "Pripremam pesmu…"
+    const val PHASE_BUFFERING = "Baferovanje…"
+    const val PHASE_WAITING = "Čekam ostale…"
+    const val PHASE_STARTING = "Krećemo…"
+    const val PHASE_PAUSED = "Pauzirano"
+    const val PHASE_STOPPED = "Zaustavljeno"
+    const val IDLE = "Spremno"
+    const val SYNCED = "Sinhronizovano"
+    const val SETTINGS = "Podešavanja"
+    const val LOW_LATENCY_TITLE = "Niska latencija"
+    const val LOW_LATENCY_EXPLAIN = "Sat se meri 4 puta u sekundi, a odstupanje se proverava 5 puta u sekundi i ispravlja već od 3 ms (umesto od 50 ms). Troši malo više interneta i baterije, a tempo pesme se ponekad čujno ubrza ili uspori na trenutak."
+    const val AUDIO_OFFSET_TITLE = "Kašnjenje zvuka"
+    const val AUDIO_OFFSET_EXPLAIN = "Ako tvoj zvuk kasni za ostalima (npr. Bluetooth slušalice), pomeri udesno dok se ne poklopi. Važi samo za ovaj telefon."
+    fun syncedMs(ms: Long) = "$SYNCED · ${kotlin.math.abs(ms)} ms"
+    fun offset(ms: Int) = if (ms == 0) "0 ms" else (if (ms > 0) "+$ms ms" else "$ms ms")
+    const val SYNCING = "Usklađujem"
+    const val CLOCK_SYNCING = "Usklađujem sat…"
+    const val DOT_SYNCED = "u taktu"
+    const val DOT_LOADING = "učitava"
+    const val DOT_WAITING = "čeka"
+    const val FOCUS_LOST = "Druga aplikacija koristi zvuk. Dodirni ovde da vratiš zvuk."
+    const val MORE = "Više opcija"
+    const val PASTE = "Nalepi link"
+    const val ADD = "Dodaj u red"
+    const val SEND = "Pošalji"
+    const val CLEAR_TEXT = "Obriši"
+    fun dotDrift(ms: Int) = if (ms > 0) "žuri $ms ms" else "kasni ${-ms} ms"
+    fun rtt(ms: Long) = "ping $ms ms"
+
+    // Errors / toasts
+    const val RESOLVE_FAILED = "Ne mogu da učitam pesmu sa YouTube-a."
+    const val SEARCH_FAILED = "Pretraga nije uspela."
+    const val NOT_YOUTUBE = "To nije ispravan YouTube link."
+    const val NOTHING_FOUND = "Na tom linku nema pesama."
+    const val SKIPPING_BROKEN = "Pesma ne može da se pusti, prelazim na sledeću:"
+    const val PLAYER_RESTARTED = "Plejer je pao. Dižem ga."
+
+    fun songs(n: Int): String {
+        val word = when {
+            n % 10 == 1 && n % 100 != 11 -> "pesma"
+            n % 10 in 2..4 && n % 100 !in 12..14 -> "pesme"
+            else -> "pesama"
+        }
+        return "$n $word"
+    }
+
+    fun clearExplain(n: Int) =
+        "${songs(n)} će biti uklonjeno iz reda za sve u sobi i muzika će stati. Ovo ne može da se poništi."
+
+    fun membersTitle(n: Int) = "$MEMBERS · $n"
+    fun queueCount(n: Int) = "$QUEUE · ${songs(n)}"
+}

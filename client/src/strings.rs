@@ -174,6 +174,10 @@ pub const VIDEO_EXPLAIN: &str =
     "Prikazuje spot u aplikaciji, uporedo sa muzikom (dupli klik na video = ceo ekran, Esc za izlaz).";
 pub const VIDEO_FULL_HINT: &str = "Dupli klik = ceo ekran";
 pub const EXIT_FULLSCREEN: &str = "Izađi iz celog ekrana (Esc)";
+pub const LOW_LATENCY_TITLE: &str = "Niska latencija";
+pub const LOW_LATENCY_EXPLAIN: &str = "Sat se meri 4 puta u sekundi, a odstupanje se proverava 5 puta u sekundi i ispravlja već od 3 ms (umesto od 50 ms). Troši malo više interneta i procesora, a tempo pesme se ponekad čujno ubrza ili uspori na trenutak.";
+pub const AUDIO_OFFSET_TITLE: &str = "Kašnjenje zvuka";
+pub const AUDIO_OFFSET_EXPLAIN: &str = "Ako tvoj zvuk kasni za ostalima (npr. Bluetooth slušalice), pomeri udesno dok se ne poklopi. Važi samo za ovaj uređaj.";
 pub const ON: &str = "Uključeno";
 pub const OFF: &str = "Isključeno";
 
@@ -206,6 +210,20 @@ pub fn reconnecting_in(secs: u64) -> String {
 
 pub fn drift(ms: i64) -> String {
     format!("{ms:+} ms")
+}
+
+/// "Sinhronizovano · 4 ms" (low-latency mode shows the exact number).
+pub fn synced_ms(ms: i64) -> String {
+    format!("{SYNCED} · {} ms", ms.abs())
+}
+
+/// "+120 ms" / "0 ms" for the audio delay slider.
+pub fn offset(ms: i64) -> String {
+    if ms == 0 {
+        "0 ms".into()
+    } else {
+        format!("{ms:+} ms")
+    }
 }
 
 pub fn rtt(ms: u64) -> String {
