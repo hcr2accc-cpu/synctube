@@ -17,6 +17,9 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import okhttp3.OkHttpClient
@@ -38,6 +41,7 @@ class AudioPlayer(context: Context, http: OkHttpClient, private val onEvent: (Pl
     private var focus = 1f
 
     private val exo: ExoPlayer
+    private val gain = GainProcessor()
 
     init {
         val upstream = OkHttpDataSource.Factory(http)
@@ -51,7 +55,16 @@ class AudioPlayer(context: Context, http: OkHttpClient, private val onEvent: (Pl
             .setUsage(C.USAGE_MEDIA)
             .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
             .build()
-        exo = ExoPlayer.Builder(context)
+        val renderers = object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean,
+            ): AudioSink = DefaultAudioSink.Builder(context)
+                .setAudioProcessors(arrayOf(gain))
+                .build()
+        }
+        exo = ExoPlayer.Builder(context, renderers)
             .setMediaSourceFactory(DefaultMediaSourceFactory(source))
             .setLoadControl(load)
             // Focus is handled by the engine: it mutes instead of pausing, so
@@ -141,6 +154,11 @@ class AudioPlayer(context: Context, http: OkHttpClient, private val onEvent: (Pl
         val v = percent.coerceIn(0, 100) / 100f
         volume = v * v * v
         exo.volume = volume * focus
+    }
+
+    /** Loudness normalization gain for the current song (0 = unchanged). */
+    fun setGainDb(db: Double) {
+        gain.setGainDb(db)
     }
 
     /** 1 = normal, lower while another app has audio focus. */

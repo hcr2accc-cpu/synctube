@@ -1,7 +1,12 @@
 // Compose UI: connect screen and room screen.
 package rs.synctube
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.VisibilityThreshold
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -29,6 +34,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
@@ -60,6 +67,7 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material.icons.rounded.VolumeOff
@@ -84,11 +92,15 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.SliderColors
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -100,6 +112,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -114,6 +130,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 private val CardShape = RoundedCornerShape(14.dp)
@@ -134,14 +151,18 @@ fun AppRoot(engine: Engine, shared: String?, onSharedTaken: () -> Unit) {
             .safeDrawingPadding(),
     ) {
         if (s.room != null) RoomScreen(engine, s) else ConnectScreen(engine, s)
-        Toasts(engine, s.toasts, Modifier.align(Alignment.BottomCenter))
+        Toasts(
+            engine,
+            s.toasts,
+            Modifier.align(Alignment.BottomCenter).padding(bottom = if (s.room != null) 76.dp else 0.dp),
+        )
     }
 }
 
 // ----- connect ------------------------------------------------------------------
 
 @Composable
-private fun ConnectScreen(engine: Engine, s: UiState) {
+internal fun ConnectScreen(engine: Engine, s: UiState) {
     val prefs = engine.prefs
     var server by rememberSaveable { mutableStateOf(prefs.serverUrl) }
     var room by rememberSaveable { mutableStateOf(prefs.room) }
@@ -339,15 +360,50 @@ private fun connText(c: ConnState) = when (c) {
 // ----- room ---------------------------------------------------------------------
 
 @Composable
-private fun RoomScreen(engine: Engine, s: UiState) {
+internal fun RoomScreen(engine: Engine, s: UiState) {
     val room = s.room ?: return
     var showMembers by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    val list = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    // The big player is item 1..3 (after the top bar and banners): once it is
+    // scrolled away, a small one stays at the bottom.
+    val nowIndex = 1 + (if (s.conn !is ConnState.Connected) 1 else 0) + (if (s.focusLost) 1 else 0)
+    val showMini by remember(nowIndex) {
+        derivedStateOf {
+            list.firstVisibleItemIndex > nowIndex ||
+                (list.firstVisibleItemIndex == nowIndex && list.firstVisibleItemScrollOffset > 420)
+        }
+    }
+    BackHandler(enabled = s.search.active) { engine.clearSearch() }
 
+    val haptics = LocalHapticFeedback.current
+    val drag = remember(list, scope) { QueueDrag(list, scope) }
+    drag.onMove = { id, to -> engine.move(id, to) }
+    val queueIds = remember(room.queue) { room.queue.map { it.id } }
+    // Keep the local order until the server's queue matches it (or give up).
+    LaunchedEffect(queueIds, drag.id, drag.order) {
+        val o = drag.order
+        if (drag.id == null && o != null) {
+            if (o != queueIds) delay(2500)
+            drag.order = null
+        }
+    }
+    LaunchedEffect(drag.active) { if (drag.active) drag.autoScroll() }
+    val display = remember(room.queue, drag.order) {
+        val o = drag.order ?: return@remember room.queue
+        val byId = room.queue.associateBy { it.id }
+        val inOrder = o.toHashSet()
+        o.mapNotNull { byId[it] } + room.queue.filter { it.id !in inOrder }
+    }
+    drag.shown = if (s.search.active) emptyList() else display.map { it.id }
+
+    Box(Modifier.fillMaxSize()) {
     LazyColumn(
-        Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 90.dp),
+        Modifier.fillMaxSize().queueDrag(drag, haptics),
+        state = list,
+        contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         item(key = "top") {
@@ -364,7 +420,16 @@ private fun RoomScreen(engine: Engine, s: UiState) {
         if (s.search.active) {
             searchItems(engine, s.search)
         } else {
-            queueItems(engine, s, room)
+            queueItems(engine, room, display, drag)
+        }
+    }
+        AnimatedVisibility(
+            visible = showMini && room.currentTrack() != null,
+            enter = fadeIn() + slideInVertically { it },
+            exit = fadeOut() + slideOutVertically { it },
+            modifier = Modifier.align(Alignment.BottomCenter),
+        ) {
+            MiniPlayer(engine, s, room) { scope.launch { list.animateScrollToItem(0) } }
         }
     }
 
@@ -508,7 +573,7 @@ private fun NowPlaying(engine: Engine, s: UiState, room: RoomState) {
         Box(
             Modifier
                 .fillMaxWidth()
-                .aspectRatio(16f / 9f)
+                .aspectRatio(2f)
                 .clip(RoundedCornerShape(10.dp))
                 .background(Pal.CARD),
             contentAlignment = Alignment.Center,
@@ -533,13 +598,12 @@ private fun NowPlaying(engine: Engine, s: UiState, room: RoomState) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (track.addedBy.isNotEmpty()) {
                     Text("${S.ADDED_BY} ${track.addedBy}", fontSize = 13.sp, color = Pal.TEXT_DIM, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                    Text("  ·  ", fontSize = 13.sp, color = Pal.TEXT_FAINT)
                 }
-                val (st, col) = statusOf(s)
-                Text(st, fontSize = 13.sp, color = col, maxLines = 1)
             }
+            Spacer(Modifier.height(8.dp))
+            StatusPill(s)
         }
-        Spacer(Modifier.height(6.dp))
+        Spacer(Modifier.height(4.dp))
         SeekBar(engine, track)
         Row(
             Modifier.fillMaxWidth(),
@@ -568,7 +632,7 @@ private fun NowPlaying(engine: Engine, s: UiState, room: RoomState) {
                 S.VOLUME, tint = Pal.TEXT_DIM, modifier = Modifier.size(20.dp),
             )
             Spacer(Modifier.width(8.dp))
-            Slider(
+            ThinSlider(
                 value = s.volume.toFloat(),
                 onValueChange = { engine.setVolume(it.toInt()) },
                 valueRange = 0f..100f,
@@ -577,6 +641,105 @@ private fun NowPlaying(engine: Engine, s: UiState, room: RoomState) {
             )
         }
     }
+}
+
+@Composable
+private fun StatusPill(s: UiState) {
+    val (st, col) = statusOf(s)
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(50))
+            .background(col.copy(alpha = 0.12f))
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Dot(col, 7)
+        Spacer(Modifier.width(6.dp))
+        Text(st, fontSize = 12.5.sp, color = col, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+/** Small player pinned to the bottom while the big one is scrolled away. */
+@Composable
+private fun MiniPlayer(engine: Engine, s: UiState, room: RoomState, onOpen: () -> Unit) {
+    val track = room.currentTrack() ?: return
+    var pos by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(track.id) {
+        while (true) {
+            pos = engine.positionMs() ?: 0L
+            delay(500)
+        }
+    }
+    val dur = track.durationMs ?: 0L
+    val frac by animateFloatAsState(if (dur > 0) (pos.toFloat() / dur).coerceIn(0f, 1f) else 0f, label = "mini")
+    val shape = RoundedCornerShape(16.dp)
+    Column(
+        Modifier
+            .navigationBarsPadding()
+            .padding(horizontal = 10.dp, vertical = 8.dp)
+            .fillMaxWidth()
+            .clip(shape)
+            .background(Pal.RAISED)
+            .border(1.dp, Pal.BORDER, shape)
+            .clickable(onClick = onOpen),
+    ) {
+        Row(Modifier.padding(start = 8.dp, top = 8.dp, bottom = 8.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Thumb(YouTubeUrl.thumbUrl(track.youtubeId), Modifier.width(64.dp))
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(track.title, color = Pal.TEXT, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val (st, col) = statusOf(s)
+                Text(st, color = col, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            val playing = s.isPlaying || room.waitingForReady
+            IconButton(onClick = { engine.togglePlay() }) {
+                Icon(if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, null, tint = Pal.TEXT, modifier = Modifier.size(30.dp))
+            }
+            IconButton(onClick = { engine.next() }) {
+                Icon(Icons.Rounded.SkipNext, null, tint = Pal.TEXT_DIM, modifier = Modifier.size(28.dp))
+            }
+        }
+        Box(Modifier.fillMaxWidth().height(3.dp).background(Pal.BORDER)) {
+            Box(Modifier.fillMaxWidth(frac).height(3.dp).background(Pal.ACCENT))
+        }
+    }
+}
+
+/** Slim slider (thin track, round thumb) that fits a phone better. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ThinSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    valueRange: ClosedFloatingPointRange<Float> = 0f..1f,
+    onValueChangeFinished: (() -> Unit)? = null,
+    @Suppress("UNUSED_PARAMETER") colors: SliderColors? = null,
+) {
+    val span = (valueRange.endInclusive - valueRange.start).takeIf { it > 0f } ?: 1f
+    Slider(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier.height(32.dp),
+        enabled = enabled,
+        valueRange = valueRange,
+        onValueChangeFinished = onValueChangeFinished,
+        thumb = {
+            Box(
+                Modifier
+                    .size(16.dp)
+                    .clip(CircleShape)
+                    .background(if (enabled) Pal.ACCENT else Pal.TEXT_FAINT),
+            )
+        },
+        track = { st ->
+            val f = ((st.value - valueRange.start) / span).coerceIn(0f, 1f)
+            Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(50)).background(Pal.BORDER)) {
+                Box(Modifier.fillMaxWidth(f).height(4.dp).background(if (enabled) Pal.ACCENT else Pal.TEXT_FAINT))
+            }
+        },
+    )
 }
 
 @Composable
@@ -600,7 +763,7 @@ private fun SeekBar(engine: Engine, track: Track?) {
     val dur = track?.durationMs ?: 0L
     val shown = if (dragging) dragValue.toLong() else pos
     Column {
-        Slider(
+        ThinSlider(
             value = if (dur > 0) shown.coerceIn(0, dur).toFloat() else 0f,
             onValueChange = { dragging = true; dragValue = it },
             onValueChangeFinished = {
@@ -769,12 +932,22 @@ private fun Thumb(url: String?, modifier: Modifier) {
     }
 }
 
-private fun androidx.compose.foundation.lazy.LazyListScope.queueItems(engine: Engine, s: UiState, room: RoomState) {
+private fun androidx.compose.foundation.lazy.LazyListScope.queueItems(
+    engine: Engine,
+    room: RoomState,
+    display: List<Track>,
+    drag: QueueDrag,
+) {
     item(key = "queue-head") {
-        Row(Modifier.padding(start = 4.dp, top = 8.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.AutoMirrored.Rounded.QueueMusic, null, tint = Pal.TEXT_DIM, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(S.queueCount(room.queue.size), color = Pal.TEXT_DIM, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+        Column(Modifier.padding(start = 4.dp, top = 8.dp, bottom = 2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.AutoMirrored.Rounded.QueueMusic, null, tint = Pal.TEXT_DIM, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(S.queueCount(room.queue.size), color = Pal.TEXT_DIM, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            }
+            if (room.queue.size > 1) {
+                Text(S.QUEUE_DRAG_HINT, color = Pal.TEXT_FAINT, fontSize = 12.sp, modifier = Modifier.padding(start = 26.dp))
+            }
         }
     }
     if (room.queue.isEmpty()) {
@@ -786,34 +959,78 @@ private fun androidx.compose.foundation.lazy.LazyListScope.queueItems(engine: En
         }
         return
     }
-    val current = room.playback.trackIndex
-    itemsIndexed(room.queue, key = { _, t -> t.id }) { i, t ->
-        QueueRow(engine, t, i, i == current, room.queue.size, past = current != null && i < current)
+    val currentId = room.playback.trackIndex?.let { room.queue.getOrNull(it) }?.id
+    val currentPos = display.indexOfFirst { it.id == currentId }
+    itemsIndexed(display, key = { _, t -> t.id }) { i, t ->
+        val dragging = drag.id == t.id
+        val shape = RoundedCornerShape(10.dp)
+        QueueRow(
+            engine,
+            drag,
+            t,
+            i,
+            current = i == currentPos,
+            size = display.size,
+            past = currentPos >= 0 && i < currentPos,
+            lifted = dragging,
+            modifier = Modifier
+                .zIndex(if (dragging) 1f else 0f)
+                .animateItem(
+                    placementSpec = if (dragging) null else spring(Spring.DampingRatioNoBouncy, Spring.StiffnessMediumLow, IntOffset.VisibilityThreshold),
+                )
+                .graphicsLayer {
+                    translationY = drag.translation(t.id)
+                    if (dragging) {
+                        shadowElevation = 10.dp.toPx()
+                        this.shape = shape
+                        scaleX = 1.03f
+                        scaleY = 1.03f
+                    }
+                },
+        )
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun QueueRow(engine: Engine, t: Track, index: Int, current: Boolean, size: Int, past: Boolean) {
-    var menu by remember { mutableStateOf(false) }
+private fun QueueRow(
+    engine: Engine,
+    drag: QueueDrag,
+    t: Track,
+    index: Int,
+    current: Boolean,
+    size: Int,
+    past: Boolean,
+    lifted: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val menu = drag.menu == t.id
+    val close = { drag.menu = null }
     val shape = RoundedCornerShape(10.dp)
-    Box {
+    Box(modifier) {
         Row(
             Modifier
                 .fillMaxWidth()
                 .clip(shape)
-                .background(if (current) Pal.ACCENT.copy(alpha = 0.12f) else Pal.PANEL)
-                .then(if (current) Modifier.border(1.dp, Pal.ACCENT.copy(alpha = 0.5f), shape) else Modifier)
-                .combinedClickable(onClick = { engine.playTrack(t.id) }, onLongClick = { menu = true })
+                .background(
+                    when {
+                        lifted -> Pal.RAISED
+                        current -> Pal.ACCENT.copy(alpha = 0.12f)
+                        else -> Pal.PANEL
+                    },
+                )
+                .then(if (current || lifted) Modifier.border(1.dp, Pal.ACCENT.copy(alpha = 0.5f), shape) else Modifier)
+                .clickable { engine.playTrack(t.id) }
                 .padding(start = 8.dp, top = 6.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                "${index + 1}",
-                color = if (current) Pal.ACCENT else Pal.TEXT_FAINT,
-                fontSize = 12.sp,
-                modifier = Modifier.width(26.dp),
-            )
+            Box(Modifier.width(26.dp)) {
+                if (current) {
+                    Icon(Icons.Rounded.GraphicEq, null, tint = Pal.ACCENT, modifier = Modifier.size(18.dp))
+                } else {
+                    Text("${index + 1}", color = Pal.TEXT_FAINT, fontSize = 12.sp)
+                }
+            }
             Thumb(YouTubeUrl.thumbUrl(t.youtubeId), Modifier.width(72.dp))
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
@@ -828,14 +1045,14 @@ private fun QueueRow(engine: Engine, t: Track, index: Int, current: Boolean, siz
                 val meta = listOfNotNull(t.addedBy.takeIf { it.isNotEmpty() }, t.durationMs?.let { fmt(it) }).joinToString(" · ")
                 if (meta.isNotEmpty()) Text(meta, color = Pal.TEXT_FAINT, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, S.MORE, tint = Pal.TEXT_FAINT) }
+            IconButton(onClick = { drag.menu = t.id }) { Icon(Icons.Rounded.MoreVert, S.MORE, tint = Pal.TEXT_FAINT) }
         }
-        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }, containerColor = Pal.CARD) {
-            MenuItem(S.PLAY_THIS, Icons.Rounded.PlayArrow) { menu = false; engine.playTrack(t.id) }
-            if (!current) MenuItem(S.PLAY_NEXT, Icons.AutoMirrored.Rounded.PlaylistAdd) { menu = false; engine.playNext(t.id) }
-            if (index > 0) MenuItem(S.MOVE_UP, Icons.Rounded.KeyboardArrowUp) { menu = false; engine.move(t.id, index - 1) }
-            if (index < size - 1) MenuItem(S.MOVE_DOWN, Icons.Rounded.KeyboardArrowDown) { menu = false; engine.move(t.id, index + 1) }
-            MenuItem(S.REMOVE, Icons.Rounded.Delete, Pal.BAD) { menu = false; engine.remove(t.id) }
+        DropdownMenu(expanded = menu, onDismissRequest = close, containerColor = Pal.CARD) {
+            MenuItem(S.PLAY_THIS, Icons.Rounded.PlayArrow) { close(); engine.playTrack(t.id) }
+            if (!current) MenuItem(S.PLAY_NEXT, Icons.AutoMirrored.Rounded.PlaylistAdd) { close(); engine.playNext(t.id) }
+            if (index > 0) MenuItem(S.MOVE_UP, Icons.Rounded.KeyboardArrowUp) { close(); engine.move(t.id, index - 1) }
+            if (index < size - 1) MenuItem(S.MOVE_DOWN, Icons.Rounded.KeyboardArrowDown) { close(); engine.move(t.id, index + 1) }
+            MenuItem(S.REMOVE, Icons.Rounded.Delete, Pal.BAD) { close(); engine.remove(t.id) }
         }
     }
 }
@@ -855,13 +1072,23 @@ private fun memberDot(m: Member, playing: Boolean): Pair<Color, String?> {
 }
 
 @Composable
-private fun SettingsDialog(engine: Engine, s: UiState, onClose: () -> Unit) {
+internal fun SettingsDialog(engine: Engine, s: UiState, onClose: () -> Unit) {
     var offset by remember { mutableStateOf(s.audioOffsetMs.toFloat()) }
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text(S.SETTINGS) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(S.NORMALIZE, color = Pal.TEXT, fontSize = 16.sp, modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = s.normalize,
+                        onCheckedChange = { engine.setNormalize(it) },
+                        colors = SwitchDefaults.colors(checkedTrackColor = Pal.ACCENT),
+                    )
+                }
+                Text(S.NORMALIZE_EXPLAIN, color = Pal.TEXT_DIM, fontSize = 13.sp)
+                HorizontalDivider(color = Pal.BORDER, modifier = Modifier.padding(vertical = 8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(S.LOW_LATENCY_TITLE, color = Pal.TEXT, fontSize = 16.sp, modifier = Modifier.weight(1f))
                     Switch(
@@ -871,12 +1098,12 @@ private fun SettingsDialog(engine: Engine, s: UiState, onClose: () -> Unit) {
                     )
                 }
                 Text(S.LOW_LATENCY_EXPLAIN, color = Pal.TEXT_DIM, fontSize = 13.sp)
-                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(color = Pal.BORDER, modifier = Modifier.padding(vertical = 8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(S.AUDIO_OFFSET_TITLE, color = Pal.TEXT, fontSize = 16.sp, modifier = Modifier.weight(1f))
                     Text(S.offset(offset.toInt()), color = Pal.TEXT, fontSize = 14.sp)
                 }
-                Slider(
+                ThinSlider(
                     value = offset,
                     onValueChange = { offset = (Math.round(it / 5f) * 5).toFloat() },
                     onValueChangeFinished = { engine.setAudioOffset(offset.toInt()) },

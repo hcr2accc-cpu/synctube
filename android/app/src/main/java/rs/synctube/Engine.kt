@@ -77,6 +77,7 @@ data class UiState(
     val focusLost: Boolean = false,
     val lowLatency: Boolean = false,
     val audioOffsetMs: Int = 0,
+    val normalize: Boolean = true,
 ) {
     val isPlaying: Boolean get() = room?.playback?.status == PlayStatus.Playing
 }
@@ -85,7 +86,7 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val main = Handler(Looper.getMainLooper())
     private val _state = MutableStateFlow(
-        UiState(volume = prefs.volume, lowLatency = prefs.lowLatency, audioOffsetMs = prefs.audioOffsetMs),
+        UiState(volume = prefs.volume, lowLatency = prefs.lowLatency, audioOffsetMs = prefs.audioOffsetMs, normalize = prefs.normalize),
     )
     val state: StateFlow<UiState> = _state
     /** Called after every state change (the media session listens). */
@@ -95,6 +96,11 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
     private val clock = Clock().apply { lowLatency = prefs.lowLatency }
     private var lowLatency = prefs.lowLatency
     private var audioOffsetMs = prefs.audioOffsetMs
+    private var normalize = prefs.normalize
+    private val scanner = LoudnessScanner(http)
+    private val loudness = prefs.loadLoudness()
+    private val measureFailed = HashSet<String>()
+    private var measureJob: Job? = null
     private var net: Net? = null
     private var player: AudioPlayer? = null
 
@@ -267,6 +273,15 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
         publish()
     }
 
+    /** Every song at about the same volume (one fixed gain per song). */
+    fun setNormalize(on: Boolean) {
+        normalize = on
+        prefs.normalize = on
+        applyGain()
+        measureNext()
+        publish()
+    }
+
     fun dismissToast(id: Long) {
         toasts.removeAll { it.id == id }
         publish()
@@ -312,6 +327,7 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
             driftMs = driftMs,
             lowLatency = lowLatency,
             audioOffsetMs = audioOffsetMs,
+            normalize = normalize,
             pendingAdds = adds.map { PendingAdd(it.id, it.playlist) },
             search = search,
             toasts = toasts.toList(),
@@ -721,6 +737,7 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
         c.durationMs?.let { start = minOf(start, (it - 1000).coerceAtLeast(0)) }
         val p = player ?: return
         c.entry = p.load(info.url, start)
+        applyGain()
         c.phase = CurPhase.Loading
         c.paused = true
         c.speed = 1.0
@@ -737,6 +754,7 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
             else -> return
         }
         c.phase = CurPhase.Active
+        measureNext()
         continuePositioned()
     }
 
@@ -922,6 +940,44 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
         }
     }
 
+    // ----- loudness ---------------------------------------------------------------------
+
+    /** The current song's normalization gain (a typical one until it is measured). */
+    private fun applyGain() {
+        val c = cur
+        val db = when {
+            !normalize || c == null -> 0.0
+            else -> loudness[c.youtubeId]?.gainDb() ?: LoudnessInfo.typicalGain(loudness.values.map { it.gainDb() })
+        }
+        player?.setGainDb(db)
+    }
+
+    /** Measures the current song and the next few, one at a time, once each. */
+    private fun measureNext() {
+        if (!normalize || measureJob != null) return
+        val r = room ?: return
+        val i = r.playback.trackIndex ?: return
+        // Not while a song is starting: it gets the bandwidth first.
+        if (cur?.phase != CurPhase.Active) return
+        val id = r.queue.drop(i).take(MEASURE_AHEAD + 1).map { it.youtubeId }
+            .firstOrNull { it !in loudness && it !in measureFailed } ?: return
+        measureJob = scope.launch {
+            val res = runCatching { scanner.measure(resolver.stream(id).url) }
+            measureJob = null
+            res.onSuccess {
+                Log.i(TAG, "loudness $id: ${it.integratedLufs} LUFS, gain ${it.gainDb()} dB")
+                loudness.remove(id)
+                loudness[id] = it
+                prefs.saveLoudness(loudness)
+            }.onFailure {
+                Log.w(TAG, "loudness scan failed for $id", it)
+                measureFailed += id
+            }
+            if (cur?.youtubeId == id) applyGain()
+            measureNext()
+        }
+    }
+
     private fun setPaused(paused: Boolean) {
         val c = cur ?: return
         val p = player ?: return
@@ -1019,6 +1075,7 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
         private const val RESYNC_EVERY_MS = 30_000L
         private const val DRIFT_EVERY_MS = 1_000L
         private const val LOW_PING_EVERY_MS = 250L
+        private const val MEASURE_AHEAD = 3
         private const val LOW_DRIFT_EVERY_MS = 200L
         private const val STATUS_MIN_GAP_MS = 400L
         private const val MAX_WAIT_MS = 6_000L

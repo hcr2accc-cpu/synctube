@@ -34,6 +34,27 @@ class Prefs(context: Context) {
         get() = p.getInt("audio_offset", 0).coerceIn(-500, 500)
         set(v) = p.edit().putInt("audio_offset", v).apply()
 
+    var normalize: Boolean
+        get() = p.getBoolean("normalize", true)
+        set(v) = p.edit().putBoolean("normalize", v).apply()
+
+    /** Measured songs (youtube id -> loudness), so each is scanned only once. */
+    fun loadLoudness(): LinkedHashMap<String, LoudnessInfo> {
+        val m = LinkedHashMap<String, LoudnessInfo>()
+        (p.getString("loudness", "") ?: "").split('\n').forEach { line ->
+            val f = line.split(':')
+            val lufs = f.getOrNull(1)?.toDoubleOrNull() ?: return@forEach
+            m[f[0]] = LoudnessInfo(lufs, f.getOrNull(2)?.toDoubleOrNull())
+        }
+        return m
+    }
+
+    fun saveLoudness(m: Map<String, LoudnessInfo>) {
+        val keep = m.entries.toList().takeLast(3000)
+        val text = keep.joinToString("\n") { (id, l) -> "$id:${"%.2f".format(java.util.Locale.ROOT, l.integratedLufs)}:${l.peakDb?.let { "%.2f".format(java.util.Locale.ROOT, it) } ?: ""}" }
+        p.edit().putString("loudness", text).apply()
+    }
+
     var recentRooms: List<String>
         get() = (p.getString("recent", "") ?: "").split('\n').filter { it.isNotBlank() }
         set(v) = p.edit().putString("recent", v.joinToString("\n")).apply()

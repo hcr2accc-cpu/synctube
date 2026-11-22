@@ -27,8 +27,8 @@ android {
         applicationId = "rs.synctube"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.5.0"
+        versionCode = 6
+        versionName = "0.5.1"
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${serverUrl.replace("\"", "")}\"")
     }
 
@@ -71,6 +71,7 @@ android {
     }
     testOptions {
         unitTests.isReturnDefaultValues = true
+        unitTests.isIncludeAndroidResources = true
     }
 }
 
@@ -100,10 +101,18 @@ dependencies {
     implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.27.1")
 
     testImplementation("junit:junit:4.13.2")
+    // UI screenshots on the JVM (run with -Dsynctube.shots=1).
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi:1.40.1")
+    testImplementation("io.github.takahirom.roborazzi:roborazzi-compose:1.40.1")
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
 
 tasks.withType<Test>().configureEach {
     systemProperty("synctube.live", System.getProperty("synctube.live") ?: "")
+    systemProperty("synctube.shots", System.getProperty("synctube.shots") ?: "")
+    systemProperty("roborazzi.test.record", "true")
     testLogging {
         showStandardStreams = true
         events("passed", "skipped", "failed")

@@ -14,6 +14,7 @@ object Pal {
     val BG = Color(0xFF101116)
     val PANEL = Color(0xFF15171E)
     val CARD = Color(0xFF1C1F28)
+    val RAISED = Color(0xFF252935)
     val FIELD = Color(0xFF0C0D12)
     val BORDER = Color(0xFF2A2E3A)
     val TEXT = Color(0xFFE8EAF0)
