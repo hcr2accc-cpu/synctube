@@ -8,6 +8,7 @@ pub mod engine;
 pub mod eq;
 pub mod gui;
 pub mod icons;
+pub mod library;
 pub mod logging;
 pub mod loudness;
 pub mod mpv;

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::deps::{self, DepPhase};
 use crate::engine::{
-    self, Command, ConnState, EngineConfig, EngineHandle, PendingAdd, Phase, View,
+    self, Command, ConnState, EngineConfig, EngineHandle, PendingAdd, Phase, SaveItem, View,
 };
 use crate::icons::{self, Icon};
 use crate::paths::Tools;
@@ -22,6 +22,9 @@ use crate::strings as s;
 use crate::theme::{self, bold_font, font};
 use crate::thumbs::Thumbs;
 use crate::ytdlp::SearchHit;
+
+#[path = "gui_library.rs"]
+mod library_ui;
 
 const TOAST_SECS: f32 = 5.0;
 const TOAST_FADE: f32 = 0.35;
@@ -105,6 +108,8 @@ pub struct App {
     accent_from: Color32,
     accent_to: Color32,
     accent_at: Instant,
+    /// The user's playlists and recommendations.
+    lib: library_ui::LibraryUi,
 }
 
 impl App {
@@ -134,6 +139,7 @@ impl App {
                 video_wid: video_host.as_ref().map(|h| h.wid()),
                 low_latency: config.low_latency,
                 audio_offset_ms: config.audio_offset_ms.clamp(-500, 500),
+                library_dir: Some(crate::paths::app_dir()),
             },
             notify.clone(),
         );
@@ -153,6 +159,7 @@ impl App {
             accent_from: theme::ACCENT,
             accent_to: theme::ACCENT,
             accent_at: Instant::now(),
+            lib: library_ui::LibraryUi::default(),
             config,
             screen,
             connecting: false,
@@ -218,6 +225,11 @@ impl App {
         if t < 1.0 {
             ctx.request_repaint();
         }
+    }
+
+    /// A window is open over the room.
+    fn modal_open(&self) -> bool {
+        self.settings_open || self.confirm_clear || self.lib.modal_open()
     }
 
     fn set_volume(&mut self, v: f64) {
@@ -549,6 +561,7 @@ impl App {
                             self.send(Command::Leave);
                             self.search_open = false;
                             self.settings_open = false;
+                            self.lib = Default::default();
                             self.screen = Screen::Connect;
                         }
                         ui.add_space(2.0);
@@ -593,6 +606,8 @@ impl App {
                 ui.add_space(14.0);
                 if self.search_open {
                     self.search_ui(ui, view, &room);
+                } else if self.lib.open {
+                    self.library_ui(ui, view, &room);
                 } else {
                     self.queue_ui(ui, view, &room);
                 }
@@ -728,6 +743,7 @@ impl App {
         if let Some(text) = pasted {
             if shared::youtube::parse_youtube_url(&text).is_some() {
                 self.send(Command::Add(text));
+                self.lib.open = false;
                 self.scroll = Some(Scroll::End);
             } else if !text.is_empty() {
                 self.link = text;
@@ -794,6 +810,7 @@ impl App {
                 self.link.clear();
                 self.send(Command::Add(text));
                 self.search_open = false;
+                self.lib.open = false;
                 self.scroll = Some(Scroll::End);
             }
         }
@@ -804,6 +821,11 @@ impl App {
         let search = &view.search;
         let mut close = false;
         let mut mode = None;
+        let back = if self.lib.open {
+            s::BACK
+        } else {
+            s::BACK_TO_QUEUE
+        };
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(s::SEARCH_TITLE)
@@ -842,7 +864,7 @@ impl App {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
-                    .add(egui::Button::new(s::BACK_TO_QUEUE).min_size(vec2(0.0, 28.0)))
+                    .add(egui::Button::new(back).min_size(vec2(0.0, 28.0)))
                     .clicked()
                 {
                     close = true;
@@ -850,7 +872,7 @@ impl App {
             });
         });
         ui.add_space(4.0);
-        let escape = !self.settings_open
+        let escape = !self.modal_open()
             && !ui.ctx().egui_wants_keyboard_input()
             && ui.input(|i| i.key_pressed(Key::Escape));
         if close || escape {
@@ -899,12 +921,15 @@ impl App {
                 for hit in &hits[range] {
                     let added = in_queue.contains(hit.youtube_id.as_str())
                         || self.search_added.contains(&hit.youtube_id);
-                    self.search_row(ui, hit, added);
+                    if self.search_row(ui, hit, added) {
+                        self.search_added.insert(hit.youtube_id.clone());
+                    }
                 }
             });
     }
 
-    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit, added: bool) {
+    /// A search result or recommendation. True when it was added to the queue.
+    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit, added: bool) -> bool {
         let (rect, resp) =
             ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
         let p = ui.painter().clone();
@@ -929,35 +954,43 @@ impl App {
 
         let btn =
             Rect::from_center_size(pos2(rect.right() - 24.0, rect.center().y), vec2(30.0, 30.0));
-        let btn_resp = ui.interact(
+        let add = add_circle(
+            ui,
             btn,
-            ui.scope_id().with(("search_add", &hit.youtube_id)),
-            Sense::click(),
-        );
-        let add = if added {
-            p.circle_filled(btn.center(), 15.0, theme::accent_alpha(36));
-            icons::paint(&p, Icon::Check, btn.shrink(9.0), theme::accent());
-            btn_resp.on_hover_text(s::IN_QUEUE);
-            false
-        } else {
-            let fill = if btn_resp.hovered() {
-                theme::accent_hover()
-            } else {
-                theme::accent()
-            };
-            p.circle_filled(btn.center(), 15.0, fill);
-            icons::paint(&p, Icon::Plus, btn.shrink(9.5), theme::ON_ACCENT);
-            let btn_resp = btn_resp
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text(if hit.playlist {
-                    s::ADD_PLAYLIST
-                } else {
-                    s::ADD_TO_QUEUE
-                });
-            btn_resp.clicked() || resp.double_clicked()
-        };
+            ("search_add", &hit.youtube_id),
+            added,
+            hit.playlist,
+        ) || (!added && resp.double_clicked());
 
-        let dur_right = btn.left() - 14.0;
+        let save = btn.translate(vec2(-36.0, 0.0));
+        let save_resp = ui
+            .interact(
+                save,
+                ui.scope_id().with(("search_save", &hit.youtube_id)),
+                Sense::click(),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(if hit.playlist {
+                s::SAVE_YT_PLAYLIST
+            } else {
+                s::SAVE_TO_PLAYLIST
+            });
+        let save_color = if save_resp.hovered() {
+            theme::TEXT
+        } else {
+            theme::TEXT_DIM
+        };
+        icons::paint(&p, Icon::ListAdd, save.shrink(8.0), save_color);
+        if save_resp.clicked() {
+            match library_ui::hit_song(hit) {
+                Some(song) => self.lib.pick_song(song),
+                None => self
+                    .lib
+                    .pick(SaveItem::YoutubePlaylist(hit.url()), &hit.title),
+            }
+        }
+
+        let dur_right = save.left() - 10.0;
         let text_left = thumb.right() + 12.0;
         let tag = hit.playlist.then(|| {
             p.layout_no_wrap(
@@ -1008,8 +1041,8 @@ impl App {
         }
         if add {
             self.send(Command::Add(hit.url()));
-            self.search_added.insert(hit.youtube_id.clone());
         }
+        add
     }
 
     fn now_playing_ui(&mut self, ui: &mut egui::Ui, view: &View, room: &RoomState) {
@@ -1215,8 +1248,7 @@ impl App {
             let upcoming = room.queue.len() - room.playback.track_index.map_or(0, |i| i + 1);
             if let Some(left) = view.shuffle_left {
                 let (r, resp) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::click());
-                ui.painter()
-                    .rect_filled(r, 8.0, theme::accent_alpha(36));
+                ui.painter().rect_filled(r, 8.0, theme::accent_alpha(36));
                 egui::Spinner::new()
                     .color(theme::accent())
                     .paint_at(ui, Rect::from_center_size(r.center(), vec2(16.0, 16.0)));
@@ -1238,13 +1270,28 @@ impl App {
             {
                 self.send(Command::Shuffle);
             }
+            if icons::ghost(ui, Icon::ListAdd, 36.0, has_track)
+                .on_hover_text(s::SAVE_TO_PLAYLIST)
+                .clicked()
+            {
+                if let Some(t) = room.current_track() {
+                    self.lib.pick_song(t.into());
+                }
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                ui.spacing_mut().slider_width = 110.0;
-                self.volume_ui(ui);
-                ui.add_space(6.0);
+                // In the smallest window only the essentials fit.
+                let tight = ui.available_width() < 330.0;
+                ui.spacing_mut().slider_width = if tight { 60.0 } else { 110.0 };
+                if tight {
+                    self.volume_slider(ui);
+                    self.mute_button(ui);
+                } else {
+                    self.volume_ui(ui);
+                    ui.add_space(6.0);
+                }
                 let on = self.config.normalize;
-                if toggle_pill(ui, s::NORMALIZE, on)
+                if toggle_pill(ui, if tight { "" } else { s::NORMALIZE }, on)
                     .on_hover_text(if on {
                         s::NORMALIZE_ON
                     } else {
@@ -1360,21 +1407,30 @@ impl App {
         let current = room.playback.track_index;
         let len = room.queue.len();
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(s::QUEUE)
-                    .font(bold_font(15.5))
-                    .color(theme::TEXT),
-            );
+            self.room_tabs(ui);
             if len > 0 {
                 let total: u64 = room.queue.iter().filter_map(|t| t.duration_ms).sum();
                 let mut text = s::songs(len);
+                let mut texts = vec![text.clone()];
                 if total > 0 {
                     text.push_str(" · ");
                     text.push_str(&fmt_time(total));
+                    texts.push(text.clone());
                 }
                 text.push_str(" · ");
                 text.push_str(s::DOUBLE_CLICK_HINT);
-                ui.label(RichText::new(text).size(12.0).color(theme::TEXT_FAINT));
+                texts.push(text);
+                // As much as fits before the filter and its buttons.
+                let room_for = ui.available_width() - 310.0;
+                let fits = texts.into_iter().rev().find_map(|t| {
+                    let g = ui
+                        .painter()
+                        .layout_no_wrap(t, font(12.0), theme::TEXT_FAINT);
+                    (g.size().x <= room_for).then_some(g)
+                });
+                if let Some(g) = fits {
+                    ui.label(g);
+                }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -1682,7 +1738,7 @@ impl App {
             ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }
 
-        let actions_w = if hovered { 4.0 * 28.0 + 6.0 } else { 0.0 };
+        let actions_w = if hovered { 5.0 * 28.0 + 6.0 } else { 0.0 };
         let dur_right = rect.right() - actions_w - 12.0;
         let text_left = thumb.right() + 12.0;
         let max_w = (dur_right - 56.0 - text_left).max(40.0);
@@ -1753,6 +1809,12 @@ impl App {
                 if let Some(to) = next_target {
                     self.send(Command::Move(t.id, to));
                 }
+            }
+            if icons::ghost(&mut ui, Icon::ListAdd, 26.0, true)
+                .on_hover_text(s::SAVE_TO_PLAYLIST)
+                .clicked()
+            {
+                self.lib.pick_song(t.into());
             }
         }
         if resp.double_clicked() && !is_cur {
@@ -2089,49 +2151,17 @@ impl App {
             self.confirm_clear = false;
             return;
         }
-        let (mut yes, mut no) = (false, false);
-        let resp = egui::Modal::new(Id::unique("confirm_clear_modal"))
-            .backdrop_color(Color32::from_black_alpha(150))
-            .frame(
-                card_frame()
-                    .inner_margin(Margin::same(22))
-                    .shadow(ctx.global_style().visuals.window_shadow),
-            )
-            .show(ctx, |ui| {
-                ui.set_width((ctx.content_rect().width() - 80.0).clamp(220.0, 360.0));
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-                    icons::paint(ui.painter(), Icon::Trash, r.shrink(2.0), theme::accent());
-                    ui.label(
-                        RichText::new(s::CLEAR_TITLE)
-                            .font(bold_font(18.0))
-                            .color(theme::TEXT),
-                    );
-                });
-                ui.add_space(8.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(s::clear_explain(len))
-                            .size(13.5)
-                            .color(theme::TEXT_DIM),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(16.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    yes = primary_button(ui, None, s::CLEAR_CONFIRM, vec2(120.0, 34.0), true)
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .clicked();
-                    no = ui
-                        .add(egui::Button::new(s::CANCEL).min_size(vec2(90.0, 34.0)))
-                        .clicked();
-                });
-            });
-        if yes {
+        let answer = confirm_modal(
+            ctx,
+            "confirm_clear_modal",
+            s::CLEAR_TITLE,
+            &s::clear_explain(len),
+            s::CLEAR_CONFIRM,
+        );
+        if answer == Some(true) {
             self.send(Command::ClearQueue);
         }
-        if yes || no || resp.should_close() {
+        if answer.is_some() {
             self.confirm_clear = false;
         }
     }
@@ -2377,6 +2407,99 @@ fn chip(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
 }
 
 // ----- shared widgets ----------------------------------------------------------------
+
+/// A window over a darkened room.
+fn modal(ctx: &egui::Context, id: &str) -> egui::Modal {
+    egui::Modal::new(Id::unique(id))
+        .backdrop_color(Color32::from_black_alpha(150))
+        .frame(
+            card_frame()
+                .inner_margin(Margin::same(22))
+                .shadow(ctx.global_style().visuals.window_shadow),
+        )
+}
+
+fn modal_title(ui: &mut egui::Ui, icon: Icon, title: &str) {
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
+        icons::paint(ui.painter(), icon, r.shrink(2.0), theme::accent());
+        ui.add(
+            egui::Label::new(
+                RichText::new(title)
+                    .font(bold_font(18.0))
+                    .color(theme::TEXT),
+            )
+            .truncate(),
+        );
+    });
+}
+
+/// Asks before deleting. `Some(true)`: go ahead, `Some(false)`: closed.
+fn confirm_modal(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    text: &str,
+    button: &str,
+) -> Option<bool> {
+    let (mut yes, mut no) = (false, false);
+    let resp = modal(ctx, id).show(ctx, |ui| {
+        ui.set_width((ctx.content_rect().width() - 80.0).clamp(220.0, 360.0));
+        modal_title(ui, Icon::Trash, title);
+        ui.add_space(8.0);
+        ui.add(egui::Label::new(RichText::new(text).size(13.5).color(theme::TEXT_DIM)).wrap());
+        ui.add_space(16.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            yes = primary_button(ui, None, button, vec2(120.0, 34.0), true)
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked();
+            no = ui
+                .add(egui::Button::new(s::CANCEL).min_size(vec2(90.0, 34.0)))
+                .clicked();
+        });
+    });
+    if yes {
+        Some(true)
+    } else if no || resp.should_close() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The round "add to the queue" button (a check once added). True when
+/// clicked.
+fn add_circle(
+    ui: &egui::Ui,
+    rect: Rect,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    added: bool,
+    playlist: bool,
+) -> bool {
+    let resp = ui.interact(rect, ui.scope_id().with(id), Sense::click());
+    let p = ui.painter();
+    if added {
+        p.circle_filled(rect.center(), 15.0, theme::accent_alpha(36));
+        icons::paint(p, Icon::Check, rect.shrink(9.0), theme::accent());
+        resp.on_hover_text(s::IN_QUEUE);
+        return false;
+    }
+    let fill = if resp.hovered() {
+        theme::accent_hover()
+    } else {
+        theme::accent()
+    };
+    p.circle_filled(rect.center(), 15.0, fill);
+    icons::paint(p, Icon::Plus, rect.shrink(9.5), theme::ON_ACCENT);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(if playlist {
+            s::ADD_PLAYLIST
+        } else {
+            s::ADD_TO_QUEUE
+        })
+        .clicked()
+}
 
 fn background_panel() -> egui::CentralPanel {
     egui::CentralPanel::default().frame(Frame::new().fill(theme::BG).inner_margin(Margin::same(16)))
@@ -3122,10 +3245,14 @@ impl eframe::App for App {
                 if self.confirm_clear && matches!(self.screen, Screen::Room) {
                     self.confirm_clear_ui(&ctx, &view);
                 }
+                if matches!(self.screen, Screen::Room) {
+                    self.library_modals(&ctx, &view);
+                }
             }
         }
         if !matches!(self.screen, Screen::Room) {
             self.confirm_clear = false;
+            self.lib = Default::default();
         }
         if !matches!(self.screen, Screen::Room) && self.video_full {
             self.set_video_full(&ctx, false);
@@ -3133,8 +3260,7 @@ impl eframe::App for App {
         self.toasts_ui(&ctx, &view);
         // The native video area covers egui drawing: hide it under menus
         // and windows.
-        let covered =
-            self.settings_open || self.confirm_clear || egui::Popup::is_any_open(&ctx);
+        let covered = self.modal_open() || egui::Popup::is_any_open(&ctx);
         let rect = self.video_rect.filter(|_| !covered);
         if let Some(h) = &mut self.video_host {
             h.place(rect, self.video_cut, ctx.pixels_per_point());
@@ -3270,6 +3396,28 @@ mod tests {
             s::DOUBLE_CLICK_HINT,
             &s::NOW_PLAYING.to_uppercase(),
             &s::SYNC_TITLE.to_uppercase(),
+            s::TAB_FOR_YOU,
+            s::BACK,
+            &s::MY_PLAYLISTS.to_uppercase(),
+            &s::RECOMMENDED.to_uppercase(),
+            s::NEW_PLAYLIST,
+            s::NEW_PLAYLIST_HINT,
+            s::NO_PLAYLISTS,
+            s::PLAYLIST_EMPTY_HINT,
+            s::SAVE_TO_PLAYLIST,
+            s::SAVE_YT_PLAYLIST,
+            s::REFRESH,
+            s::CLEAR_HISTORY_EXPLAIN,
+            s::RECS_LOADING,
+            s::RECS_EMPTY_HINT,
+            s::RECS_FAILED,
+            s::IMPORTING,
+            s::PLAYLIST_SAVE_FAILED,
+            &s::delete_playlist_title("x"),
+            &s::delete_playlist_explain(2),
+            &s::saved_to("x", 0, 0),
+            &s::saved_to("x", 3, 0),
+            &s::saved_to("x", 3, 1),
             "čćšžđČĆŠŽĐ…·—+%",
         ]
         .concat();

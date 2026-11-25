@@ -46,4 +46,20 @@ class LiveYouTubeTest {
         println("playlist tracks: ${tracks.size}, first=${tracks.firstOrNull()}")
         assertTrue(tracks.isNotEmpty())
     }
+
+    @Test fun mix() = runBlocking {
+        assumeTrue(live)
+        val r = Resolver(http)
+        for (id in listOf("dQw4w9WgXcQ", "fJ9rUzIMcZQ")) {
+            val playlist = r.mixPlaylist(id)
+            println("mix playlist $id: ${playlist.size}, no duration ${playlist.count { it.durationMs == null }}, first=${playlist.take(4)}")
+            assertTrue(playlist.size >= 10)
+            assertTrue(playlist.first().youtubeId == id)
+            val related = r.related(id)
+            println("related $id: ${related.size}, no duration ${related.count { it.durationMs == null }}, first=${related.take(4)}")
+            assertTrue(related.size >= 5)
+            val mix = r.mix(id)
+            assertTrue(mix.size >= 10)
+        }
+    }
 }

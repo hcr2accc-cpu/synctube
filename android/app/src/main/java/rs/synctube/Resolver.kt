@@ -25,6 +25,7 @@ import org.schabi.newpipe.extractor.stream.AudioTrackType
 import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import org.schabi.newpipe.extractor.stream.StreamInfo
 import org.schabi.newpipe.extractor.stream.StreamInfoItem
+import org.schabi.newpipe.extractor.stream.StreamType
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
@@ -141,8 +142,44 @@ class Resolver(private val http: OkHttpClient) {
         }
     }
 
+    /**
+     * YouTube's mix for a song: similar songs, the song itself first. Waits
+     * behind other background work.
+     */
+    suspend fun mix(id: String): List<Song> = background.withPermit {
+        withContext(Dispatchers.IO) {
+            runCatching { mixPlaylist(id) }.getOrNull()?.takeIf { it.size > 1 } ?: related(id)
+        }
+    }
+
+    internal fun mixPlaylist(id: String): List<Song> {
+        val info = PlaylistInfo.getInfo(ServiceList.YouTube, "${YouTubeUrl.watchUrl(id)}&list=RD$id")
+        return mixSongs(info.relatedItems)
+    }
+
+    /** What YouTube shows next to the video, when there is no mix. */
+    internal fun related(id: String): List<Song> {
+        val info = StreamInfo.getInfo(ServiceList.YouTube, YouTubeUrl.watchUrl(id))
+        val self = Song(id, info.name ?: id, info.duration.takeIf { it > 0 }?.times(1000))
+        return listOf(self) + mixSongs(info.relatedItems.filterIsInstance<StreamInfoItem>())
+    }
+
+    private fun mixSongs(items: List<StreamInfoItem>): List<Song> = items.mapNotNull {
+        // Live streams never end, so they cannot be queued.
+        if (it.streamType == StreamType.LIVE_STREAM || it.streamType == StreamType.AUDIO_LIVE_STREAM) return@mapNotNull null
+        val ref = YouTubeUrl.parse(it.url) as? YoutubeRef.Video ?: return@mapNotNull null
+        Song(
+            ref.id,
+            it.name?.trim()?.ifEmpty { null } ?: return@mapNotNull null,
+            it.duration.takeIf { d -> d > 0 }?.times(1000),
+            it.uploaderName?.trim()?.ifEmpty { null },
+        )
+    }.take(MIX_SONGS)
+
     companion object {
         const val MAX_QUEUE = 500
+        /** How many songs of a YouTube mix are looked at. */
+        private const val MIX_SONGS = 25
         private const val CACHE_MS = 60 * 60 * 1000L
         const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
 

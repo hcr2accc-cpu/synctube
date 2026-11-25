@@ -24,6 +24,7 @@ pub enum Icon {
     ExitFullscreen,
     Shuffle,
     Trash,
+    ListAdd,
 }
 
 /// A framed button showing `icon`, `size` points square.
@@ -337,6 +338,20 @@ pub fn paint(painter: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
                 ],
                 color,
             );
+        }
+        // Lines of a list with a plus: "save to a playlist".
+        Icon::ListAdd => {
+            let thin = Stroke::new((w * 0.11).max(1.4), color);
+            painter.line_segment([pos2(l, t + w * 0.14), pos2(rt, t + w * 0.14)], thin);
+            painter.line_segment([pos2(l, cy), pos2(l + w * 0.5, cy)], thin);
+            painter.line_segment(
+                [pos2(l, b - w * 0.14), pos2(l + w * 0.4, b - w * 0.14)],
+                thin,
+            );
+            let c = pos2(rt - w * 0.2, b - w * 0.22);
+            let arm = w * 0.22;
+            painter.line_segment([pos2(c.x - arm, c.y), pos2(c.x + arm, c.y)], thin);
+            painter.line_segment([pos2(c.x, c.y - arm), pos2(c.x, c.y + arm)], thin);
         }
         Icon::Gear => {
             let thin = Stroke::new((w * 0.13).max(1.4), color);

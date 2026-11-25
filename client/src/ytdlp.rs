@@ -23,6 +23,8 @@ const COUNTS_TIMEOUT: Duration = Duration::from_secs(8);
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 /// How many results a YouTube search returns.
 pub const SEARCH_RESULTS: usize = 20;
+/// How many songs of a YouTube mix are looked at.
+const MIX_SONGS: usize = 25;
 /// Duration used for synthetic tracks in fake mode without yt-dlp.
 pub const FAKE_DURATION_MS: u64 = 30_000;
 
@@ -374,6 +376,45 @@ impl Resolver {
             h.count = counts.get(&h.youtube_id).copied();
         }
         Ok(hits)
+    }
+
+    /// YouTube's mix for a song: similar songs, the song itself first.
+    /// Waits behind other background work.
+    pub async fn mix(&self, youtube_id: &str) -> Result<Vec<SearchHit>, String> {
+        if !shared::youtube::is_valid_video_id(youtube_id) {
+            return Err(strings::RESOLVE_FAILED.into());
+        }
+        if self.yt_dlp.is_none() && self.fake {
+            let base = youtube_id.bytes().map(usize::from).sum::<usize>() % 1000;
+            return Ok((0..5)
+                .map(|i| SearchHit {
+                    youtube_id: format!("mix{:08}", base * 10 + i),
+                    title: format!("Slična pesma {base}-{}", i + 1),
+                    channel: Some("Test".into()),
+                    duration_ms: Some(3 * 60_000),
+                    playlist: false,
+                    thumb_id: None,
+                    count: None,
+                })
+                .collect());
+        }
+        let _permit = self.background.acquire().await;
+        let json = self
+            .run(
+                &[
+                    "--flat-playlist",
+                    "-J",
+                    "--no-warnings",
+                    "--playlist-end",
+                    &MIX_SONGS.to_string(),
+                    &format!("{}&list=RD{youtube_id}", watch_url(youtube_id)),
+                ],
+                SEARCH_TIMEOUT,
+            )
+            .await?;
+        let v: Value =
+            serde_json::from_str(&json).map_err(|_| strings::SEARCH_FAILED.to_string())?;
+        Ok(parse_search(&v))
     }
 
     /// `yt-dlp --version`.

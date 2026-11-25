@@ -48,6 +48,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Logout
 import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
+import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.automirrored.rounded.Send
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
@@ -119,6 +120,7 @@ import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -133,7 +135,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
-private val CardShape = RoundedCornerShape(14.dp)
+internal val CardShape = RoundedCornerShape(14.dp)
 
 @Composable
 fun AppRoot(engine: Engine, shared: String?, onSharedTaken: () -> Unit) {
@@ -337,7 +339,7 @@ private fun Field(
 }
 
 @Composable
-private fun fieldColors() = OutlinedTextFieldDefaults.colors(
+internal fun fieldColors() = OutlinedTextFieldDefaults.colors(
     focusedContainerColor = Pal.FIELD,
     unfocusedContainerColor = Pal.FIELD,
     disabledContainerColor = Pal.FIELD,
@@ -360,7 +362,11 @@ private fun connText(c: ConnState) = when (c) {
 // ----- room ---------------------------------------------------------------------
 
 @Composable
-internal fun RoomScreen(engine: Engine, s: UiState) {
+internal fun RoomScreen(
+    engine: Engine,
+    s: UiState,
+    lib: LibraryUiState = rememberSaveable(saver = LibraryUiState.Saver) { LibraryUiState() },
+) {
     val room = s.room ?: return
     var showMembers by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
@@ -376,7 +382,23 @@ internal fun RoomScreen(engine: Engine, s: UiState) {
                 (list.firstVisibleItemIndex == nowIndex && list.firstVisibleItemScrollOffset > 420)
         }
     }
+    val opened = s.library.playlists.firstOrNull { lib.forYou && it.id == lib.playlist }
+    // "add" comes right after the player, then the tabs.
+    val tabsIndex = nowIndex + 2
+    // Ask for recommendations when the tab comes into view, and when the first
+    // song to go by turns up meanwhile. Fresh ones are kept.
+    val forYouShown = lib.forYou && !s.search.active && opened == null
+    val source = s.library.hasHistory || room.queue.isNotEmpty() || s.library.playlists.any { it.tracks.isNotEmpty() }
+    LaunchedEffect(forYouShown, source) { if (forYouShown) engine.showRecs() }
+    LaunchedEffect(opened?.id) {
+        // Another list starts at its top, not where the one before was scrolled to.
+        if (list.firstVisibleItemIndex > tabsIndex) list.scrollToItem(tabsIndex)
+    }
     BackHandler(enabled = s.search.active) { engine.clearSearch() }
+    BackHandler(enabled = opened != null && !s.search.active) { lib.playlist = null }
+    val queued = remember(room.queue) { room.queue.mapTo(HashSet()) { it.youtubeId } }
+    val saved = remember(s.library.playlists) { s.library.playlists.flatMapTo(HashSet()) { p -> p.tracks.map { it.youtubeId } } }
+    val columns = (LocalConfiguration.current.screenWidthDp / 190).coerceAtLeast(2)
 
     val haptics = LocalHapticFeedback.current
     val drag = remember(list, scope) { QueueDrag(list, scope) }
@@ -397,7 +419,7 @@ internal fun RoomScreen(engine: Engine, s: UiState) {
         val inOrder = o.toHashSet()
         o.mapNotNull { byId[it] } + room.queue.filter { it.id !in inOrder }
     }
-    drag.shown = if (s.search.active) emptyList() else display.map { it.id }
+    drag.shown = if (s.search.active || lib.forYou) emptyList() else display.map { it.id }
 
     Box(Modifier.fillMaxSize()) {
     LazyColumn(
@@ -415,12 +437,17 @@ internal fun RoomScreen(engine: Engine, s: UiState) {
         if (s.focusLost) {
             item(key = "focus") { Banner(S.FOCUS_LOST, Pal.WARN) { engine.onAppVisible() } }
         }
-        item(key = "now") { NowPlaying(engine, s, room) }
+        item(key = "now") { NowPlaying(engine, s, room, saved, lib) }
         item(key = "add") { AddField(engine, s) }
         if (s.search.active) {
-            searchItems(engine, s.search)
+            searchItems(engine, s.search, queued, saved, lib)
         } else {
-            queueItems(engine, room, display, drag)
+            item(key = "tabs") { RoomTabs(lib) }
+            when {
+                opened != null -> playlistItems(engine, opened, lib, queued)
+                lib.forYou -> forYouItems(engine, s.library, lib, queued, saved, columns)
+                else -> queueItems(engine, room, display, drag, lib)
+            }
         }
     }
         AnimatedVisibility(
@@ -433,6 +460,7 @@ internal fun RoomScreen(engine: Engine, s: UiState) {
         }
     }
 
+    LibraryDialogs(engine, s.library, lib)
     if (showMembers) MembersDialog(s) { showMembers = false }
     if (showSettings) SettingsDialog(engine, s) { showSettings = false }
     if (confirmClear) {
@@ -507,7 +535,7 @@ private fun TopBar(
 }
 
 @Composable
-private fun MenuItem(text: String, icon: ImageVector, tint: Color = Pal.TEXT, onClick: () -> Unit) {
+internal fun MenuItem(text: String, icon: ImageVector, tint: Color = Pal.TEXT, onClick: () -> Unit) {
     DropdownMenuItem(
         text = { Text(text, color = tint) },
         leadingIcon = { Icon(icon, null, tint = tint) },
@@ -560,7 +588,7 @@ private fun statusOf(s: UiState): Pair<String, Color> {
 }
 
 @Composable
-private fun NowPlaying(engine: Engine, s: UiState, room: RoomState) {
+private fun NowPlaying(engine: Engine, s: UiState, room: RoomState, saved: Set<String>, lib: LibraryUiState) {
     val track = room.currentTrack()
     Column(
         Modifier
@@ -600,8 +628,10 @@ private fun NowPlaying(engine: Engine, s: UiState, room: RoomState) {
                     Text("${S.ADDED_BY} ${track.addedBy}", fontSize = 13.sp, color = Pal.TEXT_DIM, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                 }
             }
-            Spacer(Modifier.height(8.dp))
-            StatusPill(s)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.weight(1f)) { StatusPill(s) }
+                SaveButton(track.youtubeId in saved) { lib.pick(track.toSong()) }
+            }
         }
         Spacer(Modifier.height(4.dp))
         SeekBar(engine, track)
@@ -840,14 +870,21 @@ private fun AddField(engine: Engine, s: UiState) {
                 )
             }
         }
+        if (s.library.importing > 0) Working(S.IMPORTING, Modifier.padding(start = 4.dp))
     }
 }
 
-private fun androidx.compose.foundation.lazy.LazyListScope.searchItems(engine: Engine, sv: SearchView) {
+private fun androidx.compose.foundation.lazy.LazyListScope.searchItems(
+    engine: Engine,
+    sv: SearchView,
+    queued: Set<String>,
+    saved: Set<String>,
+    lib: LibraryUiState,
+) {
     item(key = "search-head") {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             IconButton(onClick = { engine.clearSearch() }) {
-                Icon(Icons.AutoMirrored.Rounded.ArrowBack, S.BACK_TO_QUEUE, tint = Pal.TEXT_DIM)
+                Icon(Icons.AutoMirrored.Rounded.ArrowBack, S.BACK, tint = Pal.TEXT_DIM)
             }
             Chip(S.SEARCH_SONGS, !sv.playlists) { if (sv.playlists) engine.search(sv.query, false) }
             Chip(S.SEARCH_PLAYLISTS, sv.playlists) { if (!sv.playlists) engine.search(sv.query, true) }
@@ -865,13 +902,13 @@ private fun androidx.compose.foundation.lazy.LazyListScope.searchItems(engine: E
             Text(sv.error, color = Pal.TEXT_DIM, modifier = Modifier.padding(12.dp))
         }
         else -> items(sv.results, key = { "hit-" + (it.youtubeId ?: it.playlistId) }) { h ->
-            SearchRow(h) { engine.addHit(h) }
+            SearchRow(h, h.youtubeId in queued, h.youtubeId in saved, onSave = { lib.pick(h) }) { engine.addHit(h) }
         }
     }
 }
 
 @Composable
-private fun Chip(text: String, selected: Boolean, onClick: () -> Unit) {
+internal fun Chip(text: String, selected: Boolean, onClick: () -> Unit) {
     FilterChip(
         selected = selected,
         onClick = onClick,
@@ -885,18 +922,22 @@ private fun Chip(text: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun SearchRow(h: SearchHit, onAdd: () -> Unit) {
-    var added by remember { mutableStateOf(false) }
+internal fun SearchRow(h: SearchHit, queued: Boolean, saved: Boolean, onSave: () -> Unit, onAdd: () -> Unit) {
+    var tapped by remember { mutableStateOf(false) }
+    fun add() {
+        tapped = true
+        onAdd()
+    }
     Row(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(Pal.PANEL)
-            .clickable { added = true; onAdd() }
-            .padding(8.dp),
+            .clickable(onClickLabel = S.ADD) { add() }
+            .padding(start = 8.dp, top = 8.dp, bottom = 8.dp, end = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Thumb(h.thumb, Modifier.width(96.dp))
+        Thumb(h.thumb, Modifier.width(88.dp))
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
             Text(h.title, color = Pal.TEXT, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -907,16 +948,13 @@ private fun SearchRow(h: SearchHit, onAdd: () -> Unit) {
             ).joinToString(" · ")
             Text(meta, color = Pal.TEXT_DIM, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Icon(
-            Icons.AutoMirrored.Rounded.PlaylistAdd, S.ADD,
-            tint = if (added) Pal.GOOD else Pal.ACCENT,
-            modifier = Modifier.padding(horizontal = 6.dp).size(24.dp),
-        )
+        SaveButton(saved, Modifier.size(42.dp), onSave)
+        QueueButton(queued || tapped, Modifier.size(42.dp)) { add() }
     }
 }
 
 @Composable
-private fun Thumb(url: String?, modifier: Modifier) {
+internal fun Thumb(url: String?, modifier: Modifier) {
     Box(
         modifier
             .aspectRatio(16f / 9f)
@@ -937,13 +975,14 @@ private fun androidx.compose.foundation.lazy.LazyListScope.queueItems(
     room: RoomState,
     display: List<Track>,
     drag: QueueDrag,
+    lib: LibraryUiState,
 ) {
     item(key = "queue-head") {
-        Column(Modifier.padding(start = 4.dp, top = 8.dp, bottom = 2.dp)) {
+        Column(Modifier.padding(start = 4.dp, bottom = 2.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.AutoMirrored.Rounded.QueueMusic, null, tint = Pal.TEXT_DIM, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(S.queueCount(room.queue.size), color = Pal.TEXT_DIM, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text(S.songs(room.queue.size), color = Pal.TEXT_DIM, fontSize = 13.sp, fontWeight = FontWeight.Medium)
             }
             if (room.queue.size > 1) {
                 Text(S.QUEUE_DRAG_HINT, color = Pal.TEXT_FAINT, fontSize = 12.sp, modifier = Modifier.padding(start = 26.dp))
@@ -973,6 +1012,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.queueItems(
             size = display.size,
             past = currentPos >= 0 && i < currentPos,
             lifted = dragging,
+            onSave = { lib.pick(t.toSong()) },
             modifier = Modifier
                 .zIndex(if (dragging) 1f else 0f)
                 .animateItem(
@@ -1002,6 +1042,7 @@ private fun QueueRow(
     size: Int,
     past: Boolean,
     lifted: Boolean,
+    onSave: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val menu = drag.menu == t.id
@@ -1049,9 +1090,10 @@ private fun QueueRow(
         }
         DropdownMenu(expanded = menu, onDismissRequest = close, containerColor = Pal.CARD) {
             MenuItem(S.PLAY_THIS, Icons.Rounded.PlayArrow) { close(); engine.playTrack(t.id) }
-            if (!current) MenuItem(S.PLAY_NEXT, Icons.AutoMirrored.Rounded.PlaylistAdd) { close(); engine.playNext(t.id) }
+            if (!current) MenuItem(S.PLAY_NEXT, Icons.AutoMirrored.Rounded.PlaylistPlay) { close(); engine.playNext(t.id) }
             if (index > 0) MenuItem(S.MOVE_UP, Icons.Rounded.KeyboardArrowUp) { close(); engine.move(t.id, index - 1) }
             if (index < size - 1) MenuItem(S.MOVE_DOWN, Icons.Rounded.KeyboardArrowDown) { close(); engine.move(t.id, index + 1) }
+            MenuItem(S.SAVE_TO_PLAYLIST, Icons.AutoMirrored.Rounded.PlaylistAdd) { close(); onSave() }
             MenuItem(S.REMOVE, Icons.Rounded.Delete, Pal.BAD) { close(); engine.remove(t.id) }
         }
     }

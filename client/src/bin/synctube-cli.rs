@@ -5,12 +5,15 @@
 //! ```
 //! Commands on stdin: add <url> | play | pause | next | prev | seek <sec> |
 //! rm <n> | mv <n> <to> | vol <0-100> | status | quit
+//!
+//! The user's playlists (kept in --data-dir): pl | pl-save <name> <queue n> |
+//! pl-yt <name> <playlist url> | pl-queue <name> | pl-del <name> | rec | forget
 
 use std::io::BufRead;
 use std::sync::Arc;
 use std::time::Duration;
 
-use client::engine::{self, Command, EngineConfig, View};
+use client::engine::{self, Command, EngineConfig, SaveItem, SaveTo, View};
 use client::paths::Tools;
 
 struct Args {
@@ -26,6 +29,7 @@ struct Args {
     status_every: Option<f64>,
     low_latency: bool,
     audio_offset_ms: i64,
+    data_dir: Option<std::path::PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -42,6 +46,7 @@ fn parse_args() -> Result<Args, String> {
         status_every: Some(2.0),
         low_latency: false,
         audio_offset_ms: 0,
+        data_dir: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -59,6 +64,7 @@ fn parse_args() -> Result<Args, String> {
             "--audio-offset" => {
                 a.audio_offset_ms = val()?.parse().map_err(|_| "bad --audio-offset")?
             }
+            "--data-dir" => a.data_dir = Some(val()?.into()),
             "--volume" => a.volume = val()?.parse().map_err(|_| "bad --volume")?,
             "--status-every" => {
                 let s: f64 = val()?.parse().map_err(|_| "bad --status-every")?;
@@ -67,7 +73,7 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => {
                 println!(
                     "synctube-cli --server URL --room ROOM --name NAME [--password P] \
-                     [--fake-audio] [--fake-rate R] [--no-update] [--normalize] [--low-latency] [--audio-offset MS] [--volume 0-100] [--status-every SECS]"
+                     [--fake-audio] [--fake-rate R] [--no-update] [--normalize] [--low-latency] [--audio-offset MS] [--volume 0-100] [--data-dir DIR] [--status-every SECS]"
                 );
                 std::process::exit(0);
             }
@@ -125,6 +131,7 @@ fn main() {
         video_wid: None,
         low_latency: args.low_latency,
         audio_offset_ms: args.audio_offset_ms,
+        library_dir: args.data_dir.clone(),
     };
     let handle = engine::start(cfg, Arc::new(|| {}));
     handle.send(Command::Connect {
@@ -189,6 +196,47 @@ fn main() {
                 Ok(x) => Command::SetVolume(x),
                 Err(_) => continue,
             },
+            ("pl-save", [name, i]) => {
+                let i: usize = i.parse().unwrap_or(0);
+                let Some(t) = v.room.as_ref().and_then(|r| r.queue.get(i)) else {
+                    continue;
+                };
+                Command::Save {
+                    to: SaveTo::New((*name).to_string()),
+                    item: SaveItem::Songs(vec![t.into()]),
+                }
+            }
+            ("pl-yt", [name, url]) => Command::Save {
+                to: SaveTo::New((*name).to_string()),
+                item: SaveItem::YoutubePlaylist((*url).to_string()),
+            },
+            ("pl-queue", [name]) | ("pl-del", [name]) => {
+                let Some(p) = v.library.playlists.iter().find(|p| p.name == *name) else {
+                    eprintln!("no such playlist");
+                    continue;
+                };
+                if cmd == "pl-del" {
+                    Command::DeletePlaylist(p.id)
+                } else {
+                    Command::QueuePlaylist(p.id)
+                }
+            }
+            ("rec", []) => Command::RefreshRecs,
+            ("forget", []) => Command::ClearHistory,
+            ("pl", []) => {
+                let l = &v.library;
+                println!(
+                    "history={} importing={} recs_loading={} recs_error={:?}",
+                    l.has_history, l.importing, l.recs_loading, l.recs_error
+                );
+                for p in &l.playlists {
+                    println!("playlist {} ({})", p.name, p.tracks.len());
+                }
+                for s in &l.recs {
+                    println!("  rec {} {} {:?}", s.youtube_id, s.title, s.channel);
+                }
+                continue;
+            }
             ("status", []) => {
                 println!("{}", status_line(&v));
                 if let Some(r) = &v.room {

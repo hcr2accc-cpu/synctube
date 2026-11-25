@@ -33,7 +33,7 @@ object S {
     const val NOTHING_PLAYING_HINT = "Potraži pesmu ili nalepi YouTube link ispod."
     const val PASTE_LINK = "Nalepi YouTube link ili ukucaj šta tražiš"
     const val SEARCH_TITLE = "Pretraga"
-    const val BACK_TO_QUEUE = "Nazad na red"
+    const val BACK = "Nazad"
     const val SEARCHING = "Tražim na YouTube-u…"
     const val SEARCH_NOTHING = "Ništa nije pronađeno."
     const val SEARCH_SONGS = "Pesme"
@@ -60,6 +60,49 @@ object S {
     const val CLEAR_CONFIRM = "Obriši sve"
     const val QUEUE_CLEARED = "Red je obrisan"
     const val ABOUT = "Napravljeno za ekipu, 2026."
+
+    // My playlists and recommendations
+    const val TAB_FOR_YOU = "Za tebe"
+    const val MY_PLAYLISTS = "Moje plejliste"
+    const val NEW_PLAYLIST = "Nova plejlista"
+    const val NEW_PLAYLIST_HINT = "Ime nove plejliste"
+    const val PLAYLIST_NAME = "Ime plejliste"
+    const val CREATE = "Napravi"
+    const val SAVE = "Sačuvaj"
+    const val CLOSE = "Zatvori"
+    const val RENAME = "Preimenuj"
+    const val DELETE_PLAYLIST = "Obriši plejlistu"
+    const val DELETE = "Obriši"
+    const val NO_PLAYLISTS = "Još nemaš nijednu. Napravi je ovde ili sačuvaj pesmu iz reda."
+    const val PLAYLIST_EMPTY = "Plejlista je prazna"
+    const val PLAYLIST_EMPTY_HINT = "Pesme dodaješ dugmetom sa listom: u redu, u pretrazi ili kod pesme koja svira."
+    const val ADD_ALL = "Dodaj sve u red"
+    const val SAVE_TO_PLAYLIST = "Dodaj u moju plejlistu"
+    const val SAVE_YT_PLAYLIST = "Sačuvaj celu u moju plejlistu"
+    const val ALREADY_SAVED = "već je tu"
+    const val REMOVE_FROM_PLAYLIST = "Ukloni iz plejliste"
+    const val RECOMMENDED = "Preporučeno"
+    const val REFRESH = "Osveži"
+    const val CLEAR_HISTORY = "Obriši istoriju"
+    const val CLEAR_HISTORY_TITLE = "Obrisati istoriju slušanja?"
+    const val CLEAR_HISTORY_EXPLAIN = "Preporuke kreću od nule. Plejliste ostaju."
+    const val RECS_LOADING = "Tražim slične pesme…"
+    const val RECS_EMPTY = "Još nema preporuka"
+    const val RECS_EMPTY_HINT = "Slušaj pesme u sobi ili ih sačuvaj u svoju plejlistu, pa dodirni Osveži."
+    const val RECS_FROM_QUEUE = "Još nemaš istoriju slušanja, pa su ovo pesme slične onima iz reda."
+    const val RECS_FAILED = "YouTube nije vratio slične pesme."
+    const val IMPORTING = "Učitavam pesme sa plejliste…"
+    const val PLAYLIST_SAVE_FAILED = "Plejlista nije sačuvana na telefon."
+
+    fun deletePlaylistTitle(name: String) = "Obrisati plejlistu „$name“?"
+    fun deletePlaylistExplain(n: Int) = "U njoj je ${songs(n)}. Ovo ne može da se poništi."
+
+    /** What happened after saving songs to a playlist. */
+    fun savedTo(name: String, added: Int, noRoom: Int) = when {
+        noRoom > 0 -> "„$name“ je puna. Sačuvano: $added, bez mesta: $noRoom."
+        added == 0 -> "Već je u plejlisti „$name“"
+        else -> "Sačuvano u „$name“: ${songs(added)}"
+    }
 
     // Playback/sync status
     const val PHASE_RESOLVING = "Pripremam pesmu…"
@@ -114,5 +157,4 @@ object S {
         "${songs(n)} će biti uklonjeno iz reda za sve u sobi i muzika će stati. Ovo ne može da se poništi."
 
     fun membersTitle(n: Int) = "$MEMBERS · $n"
-    fun queueCount(n: Int) = "$QUEUE · ${songs(n)}"
 }

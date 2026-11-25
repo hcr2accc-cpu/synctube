@@ -3,7 +3,7 @@
 //! thread with a single-threaded tokio runtime; the UI talks to it through
 //! a command channel and reads a shared `View` snapshot.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::clock::{instant_at_local_ms, local_ms, ClockSync};
+use crate::library::{self, Library, ListenTimer, Playlist, Song};
 use crate::net::{self, NetEvent, NetHandle};
 use crate::paths::Tools;
 use crate::player::{FakePlayer, Player, PlayerEvent};
@@ -46,6 +47,24 @@ pub struct EngineConfig {
     /// How late this device's sound comes out (Bluetooth headphones,
     /// speakers); the player runs that much ahead to make up for it.
     pub audio_offset_ms: i64,
+    /// Where the user's playlists and history are kept. `None`: nowhere
+    /// (and nothing is remembered).
+    pub library_dir: Option<std::path::PathBuf>,
+}
+
+/// The playlist something is saved to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaveTo {
+    Existing(Uuid),
+    New(String),
+}
+
+/// What is saved to one of the user's playlists.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaveItem {
+    Songs(Vec<Song>),
+    /// Every song of a YouTube playlist (its link).
+    YoutubePlaylist(String),
 }
 
 /// Commands from the UI.
@@ -88,6 +107,23 @@ pub enum Command {
     SetLowLatency(bool),
     SetAudioOffset(i64),
     SetTools(Tools),
+    /// Saves songs to one of the user's playlists.
+    Save {
+        to: SaveTo,
+        item: SaveItem,
+    },
+    CreatePlaylist(String),
+    RenamePlaylist(Uuid, String),
+    DeletePlaylist(Uuid),
+    /// Removes a song (by YouTube id) from a playlist.
+    Unsave(Uuid, String),
+    MoveSaved(Uuid, String, usize),
+    /// Adds a whole playlist of the user to the room's queue.
+    QueuePlaylist(Uuid),
+    /// The recommendations are on screen: fetch them if they are old.
+    ShowRecs,
+    RefreshRecs,
+    ClearHistory,
     Shutdown,
 }
 
@@ -163,6 +199,18 @@ pub struct SearchView {
     pub error: Option<String>,
 }
 
+/// The user's playlists and recommendations.
+#[derive(Debug, Clone, Default)]
+pub struct LibraryView {
+    pub playlists: Vec<Playlist>,
+    pub recs: Vec<Song>,
+    pub recs_loading: bool,
+    pub recs_error: Option<String>,
+    pub has_history: bool,
+    /// YouTube playlists being read to be saved.
+    pub importing: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub text: String,
@@ -189,6 +237,8 @@ pub struct View {
     pub player_pos_ms: Option<u64>,
     pub pending_adds: Vec<PendingAdd>,
     pub search: SearchView,
+    /// Shared, because the UI takes a copy of the view every frame.
+    pub library: Arc<LibraryView>,
     pub toasts: Vec<Toast>,
     pub volume: f64,
     pub player_error: Option<String>,
@@ -347,6 +397,16 @@ enum TaskResult {
         seq: u64,
         result: Result<Vec<SearchHit>, String>,
     },
+    /// The songs of a YouTube playlist that is being saved.
+    Import {
+        playlist: Uuid,
+        result: Result<Vec<TrackInfo>, String>,
+    },
+    Mix {
+        run: u64,
+        weight: f64,
+        result: Result<Vec<SearchHit>, String>,
+    },
     Loudness {
         youtube_id: String,
         result: Result<crate::loudness::Loudness, String>,
@@ -396,6 +456,16 @@ struct AddJob {
     request_id: Option<u64>,
     result: Option<(Result<Vec<TrackInfo>, String>, bool)>,
     started: Instant,
+    /// A batch of one of the user's playlists (see `bulk`).
+    bulk: bool,
+}
+
+/// Recommendations being put together, one mix at a time.
+struct RecRun {
+    seeds: Vec<(Song, f64)>,
+    /// Seeds whose mix has been asked for.
+    asked: usize,
+    mixes: Vec<(f64, Vec<Song>)>,
 }
 
 struct Engine {
@@ -465,6 +535,19 @@ struct Engine {
     status_sent: Option<(MemberSync, Instant)>,
     shuffle: Option<Shuffle>,
     clear: Option<Clear>,
+
+    library: Library,
+    /// The library changed since the view was published.
+    library_dirty: bool,
+    listen: ListenTimer,
+    rec_run: Option<RecRun>,
+    /// Bumped per run, so answers to an old one are ignored.
+    rec_seq: u64,
+    recs_error: Option<String>,
+    importing: usize,
+    /// Batches of the user's playlists on their way to the queue. The next
+    /// one goes when the one before it was sent.
+    bulk: VecDeque<Vec<TrackInfo>>,
 }
 
 async fn sleep_opt(at: Option<Instant>) {
@@ -548,11 +631,20 @@ impl Engine {
             status_sent: None,
             shuffle: None,
             clear: None,
+            library: Library::default(),
+            library_dirty: true,
+            listen: ListenTimer::default(),
+            rec_run: None,
+            rec_seq: 0,
+            recs_error: None,
+            importing: 0,
+            bulk: VecDeque::new(),
         }
     }
 
     async fn run(mut self, mut cmd_rx: mpsc::UnboundedReceiver<Command>) {
         self.start_ytdlp_maintenance();
+        self.library = Library::load(self.cfg.library_dir.as_deref());
         if !self.cfg.fake_audio {
             self.loudness_store =
                 crate::loudness::Store::load(crate::paths::app_dir().join("loudness.json"));
@@ -614,8 +706,14 @@ impl Engine {
         self.view.shuffle_left = self.shuffle.as_ref().map(|s| s.order.len() - s.done);
         self.view.clear_left = self.clear.as_ref().map(|c| c.ids.len() - c.done);
         self.report_status();
+        self.count_listening();
         self.adds
             .retain(|j| j.request_id.is_some() || j.started.elapsed() < ADD_ANSWER_TIMEOUT);
+        if !self.bulk.is_empty() && !self.adds.iter().any(|j| j.bulk) {
+            // The server never answered, so the rest will not get through either.
+            self.bulk.clear();
+        }
+        self.publish_library();
         self.view.pending_adds = self
             .adds
             .iter()
@@ -826,6 +924,47 @@ impl Engine {
                     self.reconcile().await;
                 }
             }
+            Command::Save { to, item } => self.save(to, item),
+            Command::CreatePlaylist(name) => {
+                if self.library.create(&name).is_some() {
+                    self.playlists_changed();
+                }
+            }
+            Command::RenamePlaylist(id, name) => {
+                self.library.rename(id, &name);
+                self.playlists_changed();
+            }
+            Command::DeletePlaylist(id) => {
+                self.library.delete(id);
+                self.playlists_changed();
+            }
+            Command::Unsave(id, youtube_id) => {
+                self.library.remove(id, &youtube_id);
+                self.playlists_changed();
+            }
+            Command::MoveSaved(id, youtube_id, to) => {
+                self.library.move_song(id, &youtube_id, to);
+                self.playlists_changed();
+            }
+            Command::QueuePlaylist(id) => {
+                if let Some(p) = self.library.get(id) {
+                    self.bulk.extend(library::batches(&p.tracks));
+                    self.send_batch();
+                }
+            }
+            Command::ShowRecs => {
+                if self.library.recs_stale(library::unix_now()) {
+                    self.start_recs();
+                }
+            }
+            Command::RefreshRecs => self.start_recs(),
+            Command::ClearHistory => {
+                self.rec_seq += 1;
+                self.rec_run = None;
+                self.recs_error = None;
+                self.library.clear_history();
+                self.history_changed();
+            }
             Command::Shutdown => {}
         }
     }
@@ -859,6 +998,7 @@ impl Engine {
         self.view.members.clear();
         self.view.me = None;
         self.adds.clear();
+        self.bulk.clear();
         self.shuffle = None;
         self.clear = None;
         self.clock.reset();
@@ -949,6 +1089,9 @@ impl Engine {
                             .and_then(|t| t.duration_ms);
                     }
                 }
+                if self.library.learn_durations(&room_state.queue) {
+                    self.playlists_changed();
+                }
                 self.room = Some(room_state);
                 self.reconcile().await;
             }
@@ -993,7 +1136,9 @@ impl Engine {
                 // An error right after `Add` (queue full, too many pending)
                 // means the oldest unanswered add will never be resolved.
                 if let Some(i) = self.adds.iter().position(|j| j.request_id.is_none()) {
-                    self.adds.remove(i);
+                    if self.adds.remove(i).bulk {
+                        self.bulk.clear();
+                    }
                 }
                 self.toast(message, true)
             }
@@ -1100,6 +1245,19 @@ impl Engine {
                     }
                 }
             }
+            TaskResult::Import { playlist, result } => {
+                self.importing = self.importing.saturating_sub(1);
+                self.library_dirty = true;
+                match result {
+                    Ok(tracks) => self.save_songs(playlist, tracks.into_iter().map(Song::from)),
+                    Err(e) => self.toast(format!("{} {e}", strings::RESOLVE_FAILED), true),
+                }
+            }
+            TaskResult::Mix {
+                run,
+                weight,
+                result,
+            } => self.on_mix(run, weight, result),
             TaskResult::Loudness { youtube_id, result } => {
                 self.measuring.remove(&youtube_id);
                 if self.measuring_ahead.as_deref() == Some(youtube_id.as_str()) {
@@ -1641,6 +1799,7 @@ impl Engine {
             request_id,
             result: None,
             started: Instant::now(),
+            bulk: false,
         });
         let resolver = self.resolver.clone();
         let tx = self.task_tx.clone();
@@ -1696,6 +1855,200 @@ impl Engine {
             }
             Err(e) => self.toast(format!("{} {e}", strings::RESOLVE_FAILED), true),
         }
+        if job.bulk {
+            self.send_batch();
+        }
+    }
+
+    /// Sends the next batch of a playlist, unless one is on its way. The
+    /// server only takes links, so the batch goes as the answer to its first
+    /// song's link.
+    fn send_batch(&mut self) {
+        if self.adds.iter().any(|j| j.bulk) {
+            return;
+        }
+        let Some(tracks) = self.bulk.pop_front() else {
+            return;
+        };
+        let Some(first) = tracks.first() else { return };
+        let url = watch_url(&first.youtube_id);
+        self.next_add_id += 1;
+        self.adds.push(AddJob {
+            id: self.next_add_id,
+            url: url.clone(),
+            playlist: true,
+            request_id: None,
+            result: Some((Ok(tracks), false)),
+            started: Instant::now(),
+            bulk: true,
+        });
+        self.send(ClientMsg::Add { url });
+    }
+
+    // ----- the user's playlists, history and recommendations ----------------------------
+
+    fn publish_library(&mut self) {
+        if !std::mem::take(&mut self.library_dirty) {
+            return;
+        }
+        self.view.library = Arc::new(LibraryView {
+            playlists: self.library.playlists().to_vec(),
+            recs: self.library.recs().to_vec(),
+            recs_loading: self.rec_run.is_some(),
+            recs_error: self.recs_error.clone(),
+            has_history: self.library.has_history(),
+            importing: self.importing,
+        });
+    }
+
+    fn playlists_changed(&mut self) {
+        self.library_dirty = true;
+        if let Err(e) = self.library.save_playlists() {
+            self.toast(format!("{} {e}", strings::PLAYLIST_SAVE_FAILED), true);
+        }
+    }
+
+    fn history_changed(&mut self) {
+        self.library_dirty = true;
+        if let Err(e) = self.library.save_history() {
+            tracing::warn!("cannot save history: {e}");
+        }
+    }
+
+    fn save(&mut self, to: SaveTo, item: SaveItem) {
+        let id = match to {
+            SaveTo::Existing(id) => id,
+            SaveTo::New(name) => match self.library.create(&name) {
+                Some(id) => id,
+                None => return,
+            },
+        };
+        match item {
+            SaveItem::Songs(songs) => self.save_songs(id, songs),
+            SaveItem::YoutubePlaylist(url) => {
+                self.playlists_changed();
+                self.importing += 1;
+                let resolver = self.resolver.clone();
+                let tx = self.task_tx.clone();
+                tokio::spawn(async move {
+                    let result = resolver.metadata(&url).await;
+                    let _ = tx.send(TaskResult::Import {
+                        playlist: id,
+                        result,
+                    });
+                });
+            }
+        }
+    }
+
+    fn save_songs(&mut self, id: Uuid, songs: impl IntoIterator<Item = Song>) {
+        let Some(added) = self.library.add(id, songs) else {
+            return;
+        };
+        self.playlists_changed();
+        if let Some(p) = self.library.get(id) {
+            let text = strings::saved_to(&p.name, added.added, added.no_room);
+            self.toast(text, added.no_room > 0);
+        }
+    }
+
+    /// Remembers the playing song once enough of it was heard.
+    fn count_listening(&mut self) {
+        if self.cfg.library_dir.is_none() {
+            return;
+        }
+        let playing = self.phase() == Phase::Playing;
+        let (track, duration) = match &self.cur {
+            Some(c) => (Some(c.track_id), c.duration_ms),
+            None => (None, None),
+        };
+        if !self.listen.tick(track, playing, duration, Instant::now()) {
+            return;
+        }
+        let Some(t) = self
+            .room
+            .as_ref()
+            .and_then(|r| r.queue.iter().find(|t| Some(t.id) == track))
+        else {
+            return;
+        };
+        let own = self.view.me.as_ref().is_some_and(|m| m.name == t.added_by);
+        let song = Song::from(t);
+        tracing::info!(id = song.youtube_id, own, "listened");
+        self.library.record(&song, own, library::unix_now());
+        self.history_changed();
+    }
+
+    /// Starts looking for similar songs (no-op while already looking).
+    fn start_recs(&mut self) {
+        if self.rec_run.is_some() {
+            return;
+        }
+        let queue = self.room.as_ref().map_or(&[][..], |r| &r.queue);
+        let random = || (Uuid::new_v4().as_u128() >> 64) as f64 / u64::MAX as f64;
+        let seeds = self.library.seeds(queue, library::unix_now(), random);
+        self.recs_error = None;
+        self.library_dirty = true;
+        if seeds.is_empty() {
+            return;
+        }
+        self.rec_seq += 1;
+        self.rec_run = Some(RecRun {
+            seeds,
+            asked: 0,
+            mixes: Vec::new(),
+        });
+        self.next_mix();
+    }
+
+    /// Asks for the next seed's mix, or finishes the run.
+    fn next_mix(&mut self) {
+        let Some(r) = &mut self.rec_run else { return };
+        if let Some((song, weight)) = r.seeds.get(r.asked).cloned() {
+            r.asked += 1;
+            let run = self.rec_seq;
+            let resolver = self.resolver.clone();
+            let tx = self.task_tx.clone();
+            tokio::spawn(async move {
+                let result = resolver.mix(&song.youtube_id).await;
+                let _ = tx.send(TaskResult::Mix {
+                    run,
+                    weight,
+                    result,
+                });
+            });
+            return;
+        }
+        if r.mixes.is_empty() {
+            self.recs_error = Some(strings::RECS_FAILED.into());
+        }
+        self.rec_run = None;
+        self.history_changed();
+    }
+
+    fn on_mix(&mut self, run: u64, weight: f64, result: Result<Vec<SearchHit>, String>) {
+        if run != self.rec_seq {
+            return;
+        }
+        let Some(r) = &mut self.rec_run else { return };
+        match result {
+            Ok(hits) => {
+                let songs = hits.into_iter().map(|h| Song {
+                    youtube_id: h.youtube_id,
+                    title: h.title,
+                    duration_ms: h.duration_ms,
+                    channel: h.channel,
+                });
+                r.mixes.push((weight, songs.collect()));
+                let queue = self.room.as_ref().map_or(&[][..], |r| &r.queue);
+                let now = library::unix_now();
+                let items = self.library.rank(&r.seeds, &r.mixes, queue, now);
+                self.library.set_recs(items, now);
+                self.library_dirty = true;
+            }
+            Err(e) => tracing::warn!("mix failed: {e}"),
+        }
+        self.next_mix();
     }
 
     fn spawn_resolve(&self, track_id: Uuid, youtube_id: String) {

@@ -16,12 +16,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
+import java.io.File
 import kotlin.math.abs
 
 sealed class ConnState {
@@ -56,6 +60,17 @@ data class SearchView(
     val active: Boolean get() = query.isNotEmpty()
 }
 
+/** The user's playlists and recommendations. */
+data class LibraryView(
+    val playlists: List<Playlist> = emptyList(),
+    val recs: List<Song> = emptyList(),
+    val recsLoading: Boolean = false,
+    val recsError: String? = null,
+    val hasHistory: Boolean = false,
+    /** YouTube playlists being read to be saved. */
+    val importing: Int = 0,
+)
+
 data class ToastMsg(val id: Long, val text: String, val error: Boolean)
 
 data class UiState(
@@ -70,6 +85,7 @@ data class UiState(
     val driftMs: Long? = null,
     val pendingAdds: List<PendingAdd> = emptyList(),
     val search: SearchView = SearchView(),
+    val library: LibraryView = LibraryView(),
     val toasts: List<ToastMsg> = emptyList(),
     val volume: Int = 100,
     val shuffleLeft: Int? = null,
@@ -82,11 +98,26 @@ data class UiState(
     val isPlaying: Boolean get() = room?.playback?.status == PlayStatus.Playing
 }
 
-class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs: Prefs) {
+class Engine(
+    private val ctx: Context,
+    private val http: OkHttpClient,
+    val prefs: Prefs,
+    libraryDir: File? = ctx.filesDir,
+) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val main = Handler(Looper.getMainLooper())
+    private val library = Library.load(libraryDir)
+    private var recsError: String? = null
+    private var recsJob: Job? = null
+    private var importing = 0
+    private var libraryView = LibraryView(library.playlists, library.recs, hasHistory = library.hasHistory)
+    /** Files are written one at a time, in order. */
+    private val disk = Dispatchers.IO.limitedParallelism(1)
     private val _state = MutableStateFlow(
-        UiState(volume = prefs.volume, lowLatency = prefs.lowLatency, audioOffsetMs = prefs.audioOffsetMs, normalize = prefs.normalize),
+        UiState(
+            volume = prefs.volume, lowLatency = prefs.lowLatency, audioOffsetMs = prefs.audioOffsetMs,
+            normalize = prefs.normalize, library = libraryView,
+        ),
     )
     val state: StateFlow<UiState> = _state
     /** Called after every state change (the media session listens). */
@@ -124,6 +155,8 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
         val playlist: Boolean,
         var requestId: Long?,
         var result: Result<List<TrackInfo>>? = null,
+        /** A batch of one of the user's playlists (see [bulk]). */
+        val batch: Boolean = false,
         val started: Long = now(),
     )
 
@@ -146,6 +179,9 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
     private var opStarted: Long? = null
     private val adds = ArrayList<AddJob>()
     private var nextAddId = 0L
+    /** Batches of the user's playlists on their way to the queue; each goes when the one before it was sent. */
+    private val bulk = ArrayList<List<TrackInfo>>()
+    private val listen = ListenTimer()
     private var searchSeq = 0L
     private var statusOk = false
     private var statusSent: Pair<MemberSync, Long>? = null
@@ -282,6 +318,62 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
         publish()
     }
 
+    fun addSong(youtubeId: String) = user {
+        send(ClientMsg.Add(startAddJob(YoutubeRef.Video(youtubeId), null)))
+    }
+
+    /** Adds a whole playlist of the user to the room's queue. */
+    fun queuePlaylist(id: String) = user {
+        val p = library.get(id) ?: return@user
+        bulk += Library.batches(p.tracks)
+        sendBatch()
+    }
+
+    /** Saves songs to one of the user's playlists. */
+    fun save(to: SaveTo, item: SaveItem) {
+        val id = when (to) {
+            is SaveTo.Existing -> to.id
+            is SaveTo.New -> library.create(to.name) ?: return
+        }
+        when (item) {
+            is SaveItem.Songs -> saveSongs(id, item.songs)
+            is SaveItem.YoutubePlaylist -> importPlaylist(id, item.id)
+        }
+        publish()
+    }
+
+    fun createPlaylist(name: String) = edit { library.create(name) }
+    fun renamePlaylist(id: String, name: String) = edit { library.rename(id, name) }
+    fun deletePlaylist(id: String) = edit { library.delete(id) }
+    /** Removes a song from a playlist. */
+    fun unsave(id: String, youtubeId: String) = edit { library.remove(id, youtubeId) }
+    fun moveSaved(id: String, youtubeId: String, to: Int) = edit { library.moveSong(id, youtubeId, to) }
+
+    private inline fun edit(block: () -> Unit) {
+        block()
+        playlistsChanged()
+        publish()
+    }
+
+    /** The recommendations are on screen: fetch them if they are old. */
+    fun showRecs() {
+        if (library.recsStale(Library.unixNow())) refreshRecs()
+    }
+
+    fun refreshRecs() {
+        startRecs()
+        publish()
+    }
+
+    fun clearHistory() {
+        recsJob?.cancel()
+        recsJob = null
+        recsError = null
+        library.clearHistory()
+        historyChanged()
+        publish()
+    }
+
     fun dismissToast(id: Long) {
         toasts.removeAll { it.id == id }
         publish()
@@ -312,8 +404,11 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
 
     private fun publish() {
         reportStatus()
+        countListening()
         val t = now()
         adds.removeAll { it.requestId == null && t - it.started > ADD_ANSWER_TIMEOUT_MS }
+        // The server never answered, so the rest will not get through either.
+        if (adds.none { it.batch }) bulk.clear()
         while (toasts.size > MAX_TOASTS) toasts.removeAt(0)
         _state.value = UiState(
             conn = conn,
@@ -330,6 +425,7 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
             normalize = normalize,
             pendingAdds = adds.map { PendingAdd(it.id, it.playlist) },
             search = search,
+            library = libraryView,
             toasts = toasts.toList(),
             volume = volume,
             shuffleLeft = shuffle?.let { it.order.size - it.done },
@@ -393,6 +489,7 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
         members = emptyList()
         me = null
         adds.clear()
+        bulk.clear()
         shuffle = null
         clear = null
         clock.reset()
@@ -452,6 +549,7 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
                     if (c.durationMs == null) c.durationMs = m.roomState.queue.find { it.id == c.trackId }?.durationMs
                 }
                 room = m.roomState
+                if (library.learnDurations(m.roomState.queue)) playlistsChanged()
                 reconcile()
             }
             is ServerMsg.Members -> members = m.list
@@ -468,7 +566,10 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
             }
             is ServerMsg.Toast -> if (!m.message.contains(" je dodao/la")) toast(m.message, false)
             is ServerMsg.Error -> {
+                // Queue full, too many pending...: the oldest unanswered add will
+                // never be resolved, nor would the rest of a playlist.
                 adds.firstOrNull { it.requestId == null }?.let { adds.remove(it) }
+                bulk.clear()
                 toast(m.message, true)
             }
             is ServerMsg.Rejected -> conn = ConnState.Rejected(m.message)
@@ -522,6 +623,114 @@ class Engine(private val ctx: Context, private val http: OkHttpClient, val prefs
             },
             { toast(S.RESOLVE_FAILED, true) },
         )
+        if (j.batch) sendBatch()
+    }
+
+    /**
+     * Sends the next batch of a playlist, unless one is on its way. The server
+     * only takes links, so the batch goes as the answer to its first song's link.
+     */
+    private fun sendBatch() {
+        if (bulk.isEmpty() || adds.any { it.batch }) return
+        val tracks = bulk.removeAt(0)
+        val url = YouTubeUrl.watchUrl(tracks.first().youtubeId)
+        adds.add(AddJob(++nextAddId, url, playlist = true, requestId = null, result = Result.success(tracks), batch = true))
+        send(ClientMsg.Add(url))
+    }
+
+    // ----- the user's playlists, history and recommendations ---------------------------
+
+    private fun libraryChanged() {
+        libraryView = LibraryView(
+            library.playlists, library.recs, recsJob != null, recsError, library.hasHistory, importing,
+        )
+    }
+
+    private fun playlistsChanged() {
+        libraryChanged()
+        val snapshot = library.playlists
+        scope.launch {
+            val r = runCatching { withContext(disk) { library.savePlaylists(snapshot) } }
+            r.onFailure {
+                Log.w(TAG, "cannot save playlists", it)
+                toast(S.PLAYLIST_SAVE_FAILED, true)
+                publish()
+            }
+        }
+    }
+
+    private fun historyChanged() {
+        libraryChanged()
+        val snapshot = library.history
+        scope.launch {
+            runCatching { withContext(disk) { library.saveHistory(snapshot) } }
+                .onFailure { Log.w(TAG, "cannot save history", it) }
+        }
+    }
+
+    private fun saveSongs(id: String, songs: List<Song>) {
+        val a = library.add(id, songs) ?: return
+        playlistsChanged()
+        val name = library.get(id)?.name ?: return
+        toast(S.savedTo(name, a.added, a.noRoom), a.noRoom > 0)
+    }
+
+    /** Copies a YouTube playlist into one of the user's. */
+    private fun importPlaylist(id: String, youtubePlaylist: String) {
+        importing++
+        playlistsChanged()
+        scope.launch {
+            val res = runCatching { resolver.metadata(YoutubeRef.Playlist(youtubePlaylist)) }
+            importing--
+            libraryChanged()
+            res.fold(
+                { tracks -> if (tracks.isEmpty()) toast(S.NOTHING_FOUND, true) else saveSongs(id, tracks.map { it.toSong() }) },
+                {
+                    Log.w(TAG, "playlist import failed for $youtubePlaylist", it)
+                    toast(S.RESOLVE_FAILED, true)
+                },
+            )
+            publish()
+        }
+    }
+
+    /** Remembers the playing song once enough of it was heard. */
+    private fun countListening() {
+        val c = cur
+        if (!listen.tick(c?.trackId, phase() == Phase.Playing, c?.durationMs, now())) return
+        val t = room?.queue?.firstOrNull { it.id == c?.trackId } ?: return
+        library.record(t.toSong(), own = t.addedBy == me?.name, now = Library.unixNow())
+        historyChanged()
+    }
+
+    /** Looks for similar songs, one mix at a time (no-op while already looking). */
+    private fun startRecs() {
+        if (recsJob != null) return
+        val seeds = library.seeds(room?.queue.orEmpty(), Library.unixNow())
+        recsError = null
+        if (seeds.isNotEmpty()) recsJob = scope.launch { fetchRecs(seeds) }
+        libraryChanged()
+    }
+
+    private suspend fun fetchRecs(seeds: List<Seed>) {
+        val mixes = ArrayList<Mix>()
+        for (s in seeds) {
+            val res = runCatching { resolver.mix(s.song.youtubeId) }
+            currentCoroutineContext().ensureActive() // the history may have been cleared
+            val songs = res.getOrElse {
+                Log.w(TAG, "mix failed for ${s.song.youtubeId}", it)
+                null
+            } ?: continue
+            mixes += Mix(s.weight, songs)
+            val now = Library.unixNow()
+            library.setRecs(library.rank(seeds, mixes, room?.queue.orEmpty(), now), now)
+            libraryChanged()
+            publish()
+        }
+        if (mixes.isEmpty()) recsError = S.RECS_FAILED
+        recsJob = null
+        historyChanged()
+        publish()
     }
 
     private fun startSearch(q: String, playlists: Boolean) {

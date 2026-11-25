@@ -162,6 +162,58 @@ pub const PLAYLIST_TAG: &str = "plejlista";
 pub const SEARCH_HINT_PLAYLISTS: &str = "dupli klik ili + dodaje celu plejlistu u red";
 pub const ADD_PLAYLIST: &str = "Dodaj celu plejlistu u red";
 
+// My playlists and recommendations
+pub const TAB_FOR_YOU: &str = "Za tebe";
+pub const BACK: &str = "Nazad";
+pub const MY_PLAYLISTS: &str = "Moje plejliste";
+pub const NEW_PLAYLIST: &str = "Nova plejlista";
+pub const NEW_PLAYLIST_HINT: &str = "ime nove plejliste";
+pub const CREATE: &str = "Napravi";
+pub const SAVE: &str = "Sačuvaj";
+pub const RENAME: &str = "Preimenuj";
+pub const DELETE_PLAYLIST: &str = "Obriši plejlistu";
+pub const DELETE: &str = "Obriši";
+pub const NO_PLAYLISTS: &str = "Još nemaš nijednu. Napravi je ovde ili sačuvaj pesmu iz reda.";
+pub const PLAYLIST_EMPTY: &str = "Plejlista je prazna";
+pub const PLAYLIST_EMPTY_HINT: &str =
+    "Pesme dodaješ dugmetom sa listom: u redu, u pretrazi ili kod pesme koja svira.";
+pub const ADD_ALL: &str = "Dodaj sve u red";
+pub const SAVE_TO_PLAYLIST: &str = "Dodaj u moju plejlistu";
+pub const SAVE_YT_PLAYLIST: &str = "Sačuvaj celu u moju plejlistu";
+pub const ALREADY_SAVED: &str = "već je tu";
+pub const REMOVE_FROM_PLAYLIST: &str = "Ukloni iz plejliste";
+pub const RECOMMENDED: &str = "Preporučeno";
+pub const REFRESH: &str = "Osveži";
+pub const CLEAR_HISTORY: &str = "Obriši istoriju slušanja";
+pub const CLEAR_HISTORY_TITLE: &str = "Obrisati istoriju slušanja?";
+pub const CLEAR_HISTORY_EXPLAIN: &str = "Preporuke kreću od nule. Plejliste ostaju.";
+pub const RECS_LOADING: &str = "Tražim slične pesme…";
+pub const RECS_EMPTY: &str = "Još nema preporuka";
+pub const RECS_EMPTY_HINT: &str =
+    "Slušaj pesme u sobi ili ih sačuvaj u svoju plejlistu, pa klikni Osveži.";
+pub const RECS_FAILED: &str = "YouTube nije vratio slične pesme.";
+pub const IMPORTING: &str = "Učitavam pesme sa plejliste…";
+pub const PLAYLIST_SAVE_FAILED: &str = "Plejlista nije sačuvana na disk:";
+
+pub fn delete_playlist_title(name: &str) -> String {
+    format!("Obrisati plejlistu „{name}“?")
+}
+
+pub fn delete_playlist_explain(n: usize) -> String {
+    format!("U njoj je {}. Ovo ne može da se poništi.", songs(n))
+}
+
+/// What happened after saving songs to a playlist.
+pub fn saved_to(name: &str, added: usize, no_room: usize) -> String {
+    if no_room > 0 {
+        format!("„{name}“ je puna. Sačuvano: {added}, bez mesta: {no_room}.")
+    } else if added == 0 {
+        format!("Već je u plejlisti „{name}“")
+    } else {
+        format!("Sačuvano u „{name}“: {}", songs(added))
+    }
+}
+
 // Settings
 pub const SETTINGS: &str = "Podešavanja";
 pub const CLOSE: &str = "Zatvori";
