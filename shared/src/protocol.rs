@@ -83,6 +83,11 @@ pub struct RoomState {
     /// True while the server waits for clients to report `Ready` before starting.
     #[serde(default)]
     pub waiting_for_ready: bool,
+    /// Radio: when the queue runs out, the room adds similar songs. Shared by
+    /// everyone in the room. Missing from servers without radio (the client
+    /// then hides the switch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radio: Option<bool>,
 }
 
 impl RoomState {
@@ -101,6 +106,9 @@ pub enum ClientMsg {
         #[serde(default)]
         password: Option<String>,
         name: String,
+        /// The client can answer `RadioRequest`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        radio: bool,
     },
     /// Ask to add a YouTube URL. The server validates it and answers the same
     /// client with `ResolveRequest`; the client resolves metadata locally.
@@ -161,6 +169,10 @@ pub enum ClientMsg {
         #[serde(default)]
         drift_ms: Option<i32>,
     },
+    /// Turns the room's radio on or off (for everyone).
+    SetRadio {
+        on: bool,
+    },
     Leave,
 }
 
@@ -198,6 +210,13 @@ pub enum ServerMsg {
     Toast {
         message: String,
     },
+    /// Radio: find songs similar to `seeds` (YouTube ids, newest last) and
+    /// answer with `AddResolved { request_id, .. }`. Sent only to clients
+    /// that joined with `radio: true`.
+    RadioRequest {
+        request_id: u64,
+        seeds: Vec<String>,
+    },
 }
 
 #[cfg(test)]
@@ -231,6 +250,25 @@ mod tests {
     }
 
     #[test]
+    fn radio_fields_are_optional() {
+        let m: ClientMsg =
+            serde_json::from_str(r#"{"type":"Join","room":"a","name":"b"}"#).unwrap();
+        assert!(matches!(m, ClientMsg::Join { radio: false, .. }));
+        let old = ClientMsg::Join {
+            room: "a".into(),
+            password: None,
+            name: "b".into(),
+            radio: false,
+        };
+        assert!(!serde_json::to_string(&old).unwrap().contains("radio"));
+        let st: RoomState = serde_json::from_str(
+            r#"{"name":"a","queue":[],"playback":{"track_index":null,"status":"Stopped","anchor_server_ms":0,"anchor_position_ms":0,"version":0},"revision":0}"#,
+        )
+        .unwrap();
+        assert_eq!(st.radio, None);
+    }
+
+    #[test]
     fn server_msg_roundtrip() {
         let st = RoomState {
             name: "ekipa".into(),
@@ -250,6 +288,7 @@ mod tests {
             },
             revision: 7,
             waiting_for_ready: false,
+            radio: Some(true),
         };
         let m = ServerMsg::State { room_state: st };
         let s = serde_json::to_string(&m).unwrap();

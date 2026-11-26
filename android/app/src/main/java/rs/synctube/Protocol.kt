@@ -55,6 +55,8 @@ data class RoomState(
     val playback: PlaybackState = PlaybackState(),
     val revision: Long = 0,
     @SerialName("waiting_for_ready") val waitingForReady: Boolean = false,
+    /** Room radio; null from servers without radio (then there is no switch). */
+    val radio: Boolean? = null,
 ) {
     fun currentTrack(): Track? = playback.trackIndex?.let { queue.getOrNull(it) }
 }
@@ -62,7 +64,13 @@ data class RoomState(
 @Serializable
 sealed class ClientMsg {
     @Serializable @SerialName("Join")
-    data class Join(val room: String, val password: String? = null, val name: String) : ClientMsg()
+    data class Join(
+        val room: String,
+        val password: String? = null,
+        val name: String,
+        /** This client answers RadioRequest. */
+        val radio: Boolean = true,
+    ) : ClientMsg()
 
     @Serializable @SerialName("Add")
     data class Add(val url: String) : ClientMsg()
@@ -109,6 +117,9 @@ sealed class ClientMsg {
     @Serializable @SerialName("Status")
     data class Status(val loading: Boolean, @SerialName("drift_ms") val driftMs: Int? = null) : ClientMsg()
 
+    @Serializable @SerialName("SetRadio")
+    data class SetRadio(val on: Boolean) : ClientMsg()
+
     @Serializable @SerialName("Leave")
     data object Leave : ClientMsg()
 }
@@ -138,6 +149,9 @@ sealed class ServerMsg {
 
     @Serializable @SerialName("Toast")
     data class Toast(val message: String) : ServerMsg()
+
+    @Serializable @SerialName("RadioRequest")
+    data class RadioRequest(@SerialName("request_id") val requestId: Long, val seeds: List<String>) : ServerMsg()
 }
 
 object Wire {

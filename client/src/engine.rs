@@ -92,6 +92,8 @@ pub enum Command {
     /// Removes every song from the room's queue; a second one while it
     /// runs stops it.
     ClearQueue,
+    /// Turns the room's radio on or off (for everyone in the room).
+    SetRadio(bool),
     Add(String),
     /// Searches YouTube (videos, or playlists); results show up in
     /// [`View::search`].
@@ -407,6 +409,11 @@ enum TaskResult {
         weight: f64,
         result: Result<Vec<SearchHit>, String>,
     },
+    /// Songs found for the server's `RadioRequest` (empty when none).
+    Radio {
+        request_id: u64,
+        tracks: Vec<TrackInfo>,
+    },
     Loudness {
         youtube_id: String,
         result: Result<crate::loudness::Loudness, String>,
@@ -566,6 +573,23 @@ fn typical_gain(gains: &HashMap<String, f64>) -> f64 {
     let mut g: Vec<f64> = gains.values().copied().collect();
     g.sort_by(f64::total_cmp);
     g[g.len() / 2]
+}
+
+/// Radio adds at most this many songs per request (the server caps it too).
+const RADIO_BATCH: usize = 5;
+
+/// The first songs of a mix that aren't queued yet (and no repeats).
+fn radio_pick(hits: Vec<SearchHit>, queued: &HashSet<String>) -> Vec<TrackInfo> {
+    let mut seen = queued.clone();
+    hits.into_iter()
+        .filter(|h| !h.playlist && seen.insert(h.youtube_id.clone()))
+        .take(RADIO_BATCH)
+        .map(|h| TrackInfo {
+            youtube_id: h.youtube_id,
+            title: h.title,
+            duration_ms: h.duration_ms,
+        })
+        .collect()
 }
 
 fn ewma(old: u64, sample: u64) -> u64 {
@@ -845,6 +869,7 @@ impl Engine {
             }),
             Command::Shuffle => self.start_shuffle(),
             Command::ClearQueue => self.start_clear(),
+            Command::SetRadio(on) => self.send(ClientMsg::SetRadio { on }),
             Command::Add(url) => match parse_youtube_url(url.trim()) {
                 None => self.toast(strings::NOT_YOUTUBE, true),
                 Some(r) => {
@@ -978,6 +1003,7 @@ impl Engine {
             room,
             password: (!password.is_empty()).then_some(password),
             name,
+            radio: true,
         };
         self.view.conn = ConnState::Connecting { waking: false };
         self.net = Some(net::spawn(url, join, self.net_tx.clone()));
@@ -1126,6 +1152,7 @@ impl Engine {
                     },
                 }
             }
+            ServerMsg::RadioRequest { request_id, seeds } => self.start_radio(request_id, seeds),
             ServerMsg::Toast { message } => {
                 // Older servers announce every add; the queue shows it already.
                 if !message.contains(" je dodao/la") {
@@ -1258,6 +1285,10 @@ impl Engine {
                 weight,
                 result,
             } => self.on_mix(run, weight, result),
+            TaskResult::Radio { request_id, tracks } => {
+                tracing::info!(request_id, songs = tracks.len(), "radio answer");
+                self.send(ClientMsg::AddResolved { request_id, tracks });
+            }
             TaskResult::Loudness { youtube_id, result } => {
                 self.measuring.remove(&youtube_id);
                 if self.measuring_ahead.as_deref() == Some(youtube_id.as_str()) {
@@ -2026,6 +2057,32 @@ impl Engine {
         self.history_changed();
     }
 
+    /// Radio: looks up YouTube's mix of the newest seed (older seeds when
+    /// that finds nothing new) and answers the server with the songs that
+    /// aren't in the queue yet.
+    fn start_radio(&mut self, request_id: u64, seeds: Vec<String>) {
+        let queued: HashSet<String> = self
+            .room
+            .as_ref()
+            .map(|r| r.queue.iter().map(|t| t.youtube_id.clone()).collect())
+            .unwrap_or_default();
+        let resolver = self.resolver.clone();
+        let tx = self.task_tx.clone();
+        tokio::spawn(async move {
+            let mut tracks = Vec::new();
+            for seed in seeds.iter().rev() {
+                match resolver.mix(seed).await {
+                    Ok(hits) => tracks = radio_pick(hits, &queued),
+                    Err(e) => tracing::warn!(seed, "radio mix failed: {e}"),
+                }
+                if !tracks.is_empty() {
+                    break;
+                }
+            }
+            let _ = tx.send(TaskResult::Radio { request_id, tracks });
+        });
+    }
+
     fn on_mix(&mut self, run: u64, weight: f64, result: Result<Vec<SearchHit>, String>) {
         if run != self.rec_seq {
             return;
@@ -2508,5 +2565,34 @@ impl Engine {
             self.op_started = Some(Instant::now());
             self.next_drift = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod radio_tests {
+    use super::*;
+
+    fn hit(id: &str) -> SearchHit {
+        SearchHit {
+            youtube_id: id.into(),
+            title: id.into(),
+            channel: None,
+            duration_ms: Some(1000),
+            playlist: false,
+            thumb_id: None,
+            count: None,
+        }
+    }
+
+    #[test]
+    fn radio_pick_skips_queued_and_repeats() {
+        let queued: HashSet<String> = ["a".to_string()].into();
+        let hits = ["a", "b", "b", "c", "d", "e", "f", "g"].map(hit).to_vec();
+        let ids: Vec<String> = radio_pick(hits, &queued)
+            .into_iter()
+            .map(|t| t.youtube_id)
+            .collect();
+        assert_eq!(ids, ["b", "c", "d", "e", "f"]);
+        assert!(radio_pick(vec![hit("a")], &queued).is_empty());
     }
 }

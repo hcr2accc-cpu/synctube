@@ -175,6 +175,8 @@ fn main() {
             ("next", []) => Command::Next,
             ("shuffle", []) => Command::Shuffle,
             ("clear", []) => Command::ClearQueue,
+            ("radio", ["on"]) => Command::SetRadio(true),
+            ("radio", ["off"]) => Command::SetRadio(false),
             ("prev", []) => Command::Previous,
             ("seek", [s]) => match s.parse::<f64>() {
                 Ok(s) => Command::Seek((s * 1000.0) as u64),

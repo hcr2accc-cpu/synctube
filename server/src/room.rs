@@ -20,6 +20,10 @@ use crate::{now_ms, strings, AppState};
 const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
 /// Pending resolve requests expire after this long.
 const RESOLVE_TTL: Duration = Duration::from_secs(180);
+/// Radio adds at most this many songs at a time.
+const RADIO_BATCH: usize = 5;
+/// Radio sends at most this many recent songs as seeds.
+const RADIO_SEEDS: usize = 5;
 /// Max outstanding resolve requests per connection.
 const MAX_PENDING_PER_CONN: usize = 5;
 /// "Previous" restarts the current track when it played longer than this.
@@ -32,6 +36,7 @@ pub(crate) enum RoomCmd {
         conn: Uuid,
         name: String,
         password: Option<String>,
+        radio: bool,
         out: mpsc::Sender<Out>,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -50,6 +55,15 @@ struct MemberConn {
     out: mpsc::Sender<Out>,
     /// Last status the member reported.
     sync: MemberSync,
+    /// The client can answer `RadioRequest`.
+    radio: bool,
+}
+
+/// An outstanding `RadioRequest`.
+struct RadioAsk {
+    request_id: u64,
+    conn: Uuid,
+    deadline: Instant,
 }
 
 struct Barrier {
@@ -75,6 +89,12 @@ struct Room {
     next_request_id: u64,
     empty_since: Option<Instant>,
     dirty: bool,
+    radio: bool,
+    radio_ask: Option<RadioAsk>,
+    /// Members already asked to refill after the queue track `radio_for`.
+    radio_tried: HashSet<Uuid>,
+    radio_for: Option<Uuid>,
+    radio_turn: usize,
 }
 
 pub(crate) async fn run_room(
@@ -97,6 +117,11 @@ pub(crate) async fn run_room(
         next_request_id: 1,
         empty_since: Some(Instant::now()),
         dirty: false,
+        radio: false,
+        radio_ask: None,
+        radio_tried: HashSet::new(),
+        radio_for: None,
+        radio_turn: 0,
     };
     loop {
         let deadline = room.next_deadline();
@@ -107,6 +132,7 @@ pub(crate) async fn run_room(
             },
             _ = sleep_until_opt(deadline) => room.on_timer(),
         }
+        room.maybe_fill_radio();
         room.flush();
         if room.expired() {
             app.remove_room(&name, generation);
@@ -134,6 +160,7 @@ impl Room {
             playback: self.playback.clone(),
             revision: self.revision,
             waiting_for_ready: self.barrier.is_some(),
+            radio: Some(self.radio),
         }
     }
 
@@ -227,6 +254,9 @@ impl Room {
         if let Some(b) = &self.barrier {
             consider(b.deadline);
         }
+        if let Some(a) = &self.radio_ask {
+            consider(a.deadline);
+        }
         if let Some(end_ms) = self.auto_advance_at_ms() {
             let now = now_ms();
             consider(Instant::now() + Duration::from_millis(end_ms.saturating_sub(now)));
@@ -257,6 +287,10 @@ impl Room {
         if self.barrier.as_ref().is_some_and(|b| now >= b.deadline) {
             tracing::debug!(room = %self.name, "ready barrier timed out");
             self.go_playing(self.cfg().start_lead_ms);
+        }
+        if self.radio_ask.as_ref().is_some_and(|a| now >= a.deadline) {
+            tracing::debug!(room = %self.name, "radio request timed out");
+            self.radio_ask = None;
         }
         if self.auto_advance_at_ms().is_some_and(|t| now_ms() >= t) {
             tracing::debug!(room = %self.name, "auto-advance on server timeline");
@@ -365,9 +399,10 @@ impl Room {
                 conn,
                 name,
                 password,
+                radio,
                 out,
                 reply,
-            } => self.join(conn, name, password, out, reply),
+            } => self.join(conn, name, password, radio, out, reply),
             RoomCmd::Leave { conn } => self.leave(conn),
             RoomCmd::Msg { conn, msg } => {
                 if self.members.iter().any(|m| m.id == conn) {
@@ -382,6 +417,7 @@ impl Room {
         conn: Uuid,
         name: String,
         password: Option<String>,
+        radio: bool,
         out: mpsc::Sender<Out>,
         reply: oneshot::Sender<Result<(), String>>,
     ) {
@@ -411,6 +447,7 @@ impl Room {
             name: name.clone(),
             out,
             sync: MemberSync::default(),
+            radio,
         });
         self.empty_since = None;
         tracing::info!(room = %self.name, %name, members = self.members.len(), "member joined");
@@ -439,6 +476,9 @@ impl Room {
         };
         let m = self.members.remove(pos);
         self.pending.retain(|_, (c, _)| *c != conn);
+        if self.radio_ask.as_ref().is_some_and(|a| a.conn == conn) {
+            self.radio_ask = None;
+        }
         tracing::info!(room = %self.name, name = %m.name, members = self.members.len(), "member left");
         if self.members.is_empty() {
             self.empty_since = Some(Instant::now());
@@ -470,6 +510,20 @@ impl Room {
         match msg {
             ClientMsg::Join { .. } => self.error(conn, strings::ALREADY_JOINED),
             ClientMsg::Ping { .. } | ClientMsg::Leave => {}
+            ClientMsg::SetRadio { on } => {
+                if self.radio != on {
+                    self.radio = on;
+                    self.radio_tried.clear();
+                    self.touch();
+                    let name = self.member_name(conn);
+                    self.broadcast_except(
+                        conn,
+                        &ServerMsg::Toast {
+                            message: strings::radio_switched(&name, on),
+                        },
+                    );
+                }
+            }
             ClientMsg::Add { url } => self.add(conn, &url),
             ClientMsg::AddResolved { request_id, tracks } => {
                 self.add_resolved(conn, request_id, tracks)
@@ -607,6 +661,13 @@ impl Room {
     }
 
     fn add_resolved(&mut self, conn: Uuid, request_id: u64, tracks: Vec<shared::TrackInfo>) {
+        if self
+            .radio_ask
+            .as_ref()
+            .is_some_and(|a| a.request_id == request_id && a.conn == conn)
+        {
+            return self.radio_resolved(tracks);
+        }
         match self.pending.get(&request_id) {
             Some((c, t)) if *c == conn && t.elapsed() < RESOLVE_TTL => {
                 self.pending.remove(&request_id);
@@ -650,6 +711,100 @@ impl Room {
         if count < total_valid {
             self.error(conn, &strings::truncated(count));
         }
+        if self.playback.status == PlayStatus::Stopped {
+            self.start_track(first_new);
+        }
+    }
+
+    // ----- radio ----------------------------------------------------------------
+
+    /// Asks one member for similar songs when the radio is on and the queue
+    /// is about to run out (the current song is the last one) or already has.
+    /// Each member is asked at most once per queue end, one at a time.
+    fn maybe_fill_radio(&mut self) {
+        if !self.radio || self.radio_ask.is_some() || self.queue.len() >= MAX_QUEUE {
+            return;
+        }
+        let Some(last) = self.queue.last().map(|t| t.id) else {
+            return;
+        };
+        let at_end = match self.playback.track_index {
+            Some(i) => i + 1 >= self.queue.len(),
+            None => self.playback.status == PlayStatus::Stopped,
+        };
+        if !at_end {
+            return;
+        }
+        if self.radio_for != Some(last) {
+            self.radio_for = Some(last);
+            self.radio_tried.clear();
+        }
+        let candidates: Vec<Uuid> = self
+            .members
+            .iter()
+            .filter(|m| m.radio && !self.radio_tried.contains(&m.id))
+            .map(|m| m.id)
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let conn = candidates[self.radio_turn % candidates.len()];
+        self.radio_turn = self.radio_turn.wrapping_add(1);
+        self.radio_tried.insert(conn);
+        let end = self
+            .playback
+            .track_index
+            .map_or(self.queue.len(), |i| i + 1);
+        let start = end.saturating_sub(RADIO_SEEDS);
+        let seeds: Vec<String> = self.queue[start..end]
+            .iter()
+            .map(|t| t.youtube_id.clone())
+            .collect();
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.radio_ask = Some(RadioAsk {
+            request_id,
+            conn,
+            deadline: Instant::now() + self.cfg().radio_timeout,
+        });
+        tracing::debug!(room = %self.name, request_id, "radio request");
+        self.send_to(conn, &ServerMsg::RadioRequest { request_id, seeds });
+    }
+
+    /// Songs a member found for the radio. An empty or useless answer is not
+    /// shown to anyone; the next member is asked instead.
+    fn radio_resolved(&mut self, tracks: Vec<shared::TrackInfo>) {
+        self.radio_ask = None;
+        if !self.radio {
+            return;
+        }
+        let mut seen: HashSet<String> = self.queue.iter().map(|t| t.youtube_id.clone()).collect();
+        let room_left = MAX_QUEUE.saturating_sub(self.queue.len());
+        let new: Vec<Track> = tracks
+            .into_iter()
+            .filter(|t| is_valid_video_id(&t.youtube_id) && seen.insert(t.youtube_id.clone()))
+            .take(RADIO_BATCH.min(room_left))
+            .map(|t| {
+                let title = clamp_chars(&t.title, MAX_TITLE_CHARS);
+                Track {
+                    id: Uuid::new_v4(),
+                    title: if title.is_empty() {
+                        t.youtube_id.clone()
+                    } else {
+                        title
+                    },
+                    youtube_id: t.youtube_id,
+                    duration_ms: t.duration_ms.filter(|d| *d > 0 && *d <= MAX_DURATION_MS),
+                    added_by: strings::RADIO_ADDED_BY.to_string(),
+                }
+            })
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        let first_new = self.queue.len();
+        self.queue.extend(new);
+        self.touch();
         if self.playback.status == PlayStatus::Stopped {
             self.start_track(first_new);
         }

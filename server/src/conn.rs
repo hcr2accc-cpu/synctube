@@ -162,17 +162,19 @@ pub(crate) async fn handle_socket(socket: WebSocket, app: AppState) {
                 room: room_name,
                 password,
                 name,
-            } if room.is_none() => match join(&app, conn, room_name, password, name, &out_tx).await
-            {
-                Ok(handle) => room = Some(handle),
-                Err(reason) => {
-                    let _ = out_tx.try_send(to_out(&ServerMsg::Rejected { message: reason }));
-                    let _ = out_tx.try_send(Out::Close);
-                    drop(out_tx);
-                    let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
-                    return;
+                radio,
+            } if room.is_none() => {
+                match join(&app, conn, room_name, password, name, radio, &out_tx).await {
+                    Ok(handle) => room = Some(handle),
+                    Err(reason) => {
+                        let _ = out_tx.try_send(to_out(&ServerMsg::Rejected { message: reason }));
+                        let _ = out_tx.try_send(Out::Close);
+                        drop(out_tx);
+                        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+                        return;
+                    }
                 }
-            },
+            }
             other => match &room {
                 Some(h) => {
                     if h.tx.send(RoomCmd::Msg { conn, msg: other }).await.is_err() {
@@ -200,6 +202,7 @@ async fn join(
     room: String,
     password: Option<String>,
     name: String,
+    radio: bool,
     out: &mpsc::Sender<Out>,
 ) -> Result<crate::RoomHandle, String> {
     let room = clamp_chars(&room, MAX_ROOM_CHARS).to_lowercase();
@@ -220,6 +223,7 @@ async fn join(
             conn,
             name: name.clone(),
             password: password.clone(),
+            radio,
             out: out.clone(),
             reply: reply_tx,
         };

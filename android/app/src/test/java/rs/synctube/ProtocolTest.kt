@@ -11,7 +11,7 @@ class ProtocolTest {
         assertEquals("""{"type":"Play"}""", Wire.encode(ClientMsg.Play))
         assertEquals("""{"type":"Next"}""", Wire.encode(ClientMsg.Next(null)))
         assertEquals("""{"type":"Next","version":3}""", Wire.encode(ClientMsg.Next(3)))
-        assertEquals("""{"type":"Join","room":"ekipa","name":"Ana"}""", Wire.encode(ClientMsg.Join("ekipa", null, "Ana")))
+        assertEquals("""{"type":"Join","room":"ekipa","name":"Ana","radio":true}""", Wire.encode(ClientMsg.Join("ekipa", null, "Ana")))
         assertEquals("""{"type":"Status","loading":true}""", Wire.encode(ClientMsg.Status(true, null)))
         assertEquals(
             """{"type":"AddResolved","request_id":7,"tracks":[{"youtube_id":"dQw4w9WgXcQ","title":"T","duration_ms":1000}]}""",

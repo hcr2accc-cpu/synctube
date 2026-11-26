@@ -49,11 +49,27 @@ impl Client {
         name: &str,
         password: Option<&str>,
     ) -> Result<Client, String> {
+        Self::join_with(url, room, name, password, false).await
+    }
+
+    /// Joins as a client that can answer `RadioRequest`.
+    async fn join_radio(url: &str, room: &str, name: &str) -> Client {
+        Self::join_with(url, room, name, None, true).await.unwrap()
+    }
+
+    async fn join_with(
+        url: &str,
+        room: &str,
+        name: &str,
+        password: Option<&str>,
+        radio: bool,
+    ) -> Result<Client, String> {
         let mut ws = Self::connect_raw(url).await;
         let join = ClientMsg::Join {
             room: room.into(),
             password: password.map(String::from),
             name: name.into(),
+            radio,
         };
         ws.send(Message::text(serde_json::to_string(&join).unwrap()))
             .await
@@ -826,4 +842,159 @@ async fn status_is_relayed_in_members() {
     .await;
     let extra = a.drain(Duration::from_millis(300)).await;
     assert!(!extra.iter().any(|m| matches!(m, ServerMsg::Members { .. })));
+}
+
+// ----- radio ---------------------------------------------------------------------
+
+fn radio_cfg() -> Config {
+    Config {
+        radio_timeout: Duration::from_millis(500),
+        ..fast_cfg()
+    }
+}
+
+/// Waits for a `RadioRequest` and returns its id and seeds.
+async fn radio_request(c: &mut Client) -> (u64, Vec<String>) {
+    match c
+        .wait_for("RadioRequest", |m| {
+            matches!(m, ServerMsg::RadioRequest { .. })
+        })
+        .await
+    {
+        ServerMsg::RadioRequest { request_id, seeds } => (request_id, seeds),
+        _ => unreachable!(),
+    }
+}
+
+fn is_radio_request(m: &ServerMsg) -> bool {
+    matches!(m, ServerMsg::RadioRequest { .. })
+}
+
+#[tokio::test]
+async fn radio_switch_is_shared() {
+    let (url, _) = start(radio_cfg()).await;
+    let mut a = Client::join_radio(&url, "radio1", "Ana").await;
+    let mut b = Client::join(&url, "radio1", "Bojan", None).await.unwrap();
+    assert_eq!(b.state.radio, Some(false));
+    b.send(ClientMsg::SetRadio { on: true }).await;
+    a.wait_for(
+        "toast",
+        |m| matches!(m, ServerMsg::Toast { message } if message.contains("Bojan")),
+    )
+    .await;
+    a.wait_state("radio on", |s| s.radio == Some(true)).await;
+    b.wait_state("radio on", |s| s.radio == Some(true)).await;
+    a.send(ClientMsg::SetRadio { on: false }).await;
+    b.wait_state("radio off", |s| s.radio == Some(false)).await;
+}
+
+#[tokio::test]
+async fn radio_refills_last_song_once_and_skips_duplicates() {
+    let (url, _) = start(radio_cfg()).await;
+    let mut a = Client::join_radio(&url, "radio2", "Ana").await;
+    let mut old = Client::join(&url, "radio2", "Stari", None).await.unwrap();
+    a.add(
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        vec![track("aaaaaaaaaaa", Some(200_000))],
+    )
+    .await;
+    a.wait_state("one song", |s| s.queue.len() == 1).await;
+    // Radio off: the last song playing asks nobody.
+    assert!(!a
+        .drain(Duration::from_millis(200))
+        .await
+        .iter()
+        .any(is_radio_request));
+
+    old.send(ClientMsg::SetRadio { on: true }).await;
+    let (request_id, seeds) = radio_request(&mut a).await;
+    assert_eq!(seeds, vec!["aaaaaaaaaaa".to_string()]);
+    // Only one request at a time, and never to a client without radio.
+    let msgs = old.drain(Duration::from_millis(200)).await;
+    assert!(!msgs.iter().any(is_radio_request));
+
+    a.send(ClientMsg::AddResolved {
+        request_id,
+        tracks: vec![
+            track("aaaaaaaaaaa", Some(1000)),
+            track("bbbbbbbbbbb", Some(200_000)),
+            track("bbbbbbbbbbb", Some(200_000)),
+            track("ccccccccccc", Some(200_000)),
+        ],
+    })
+    .await;
+    let st = old.wait_state("radio songs", |s| s.queue.len() == 3).await;
+    assert_eq!(st.queue[1].youtube_id, "bbbbbbbbbbb");
+    assert_eq!(st.queue[2].youtube_id, "ccccccccccc");
+    assert_eq!(st.queue[1].added_by, "Radio");
+    // The current song is no longer the last one, so nothing more is asked.
+    assert!(!a
+        .drain(Duration::from_millis(200))
+        .await
+        .iter()
+        .any(is_radio_request));
+}
+
+#[tokio::test]
+async fn radio_restarts_a_stopped_room() {
+    let (url, _) = start(radio_cfg()).await;
+    let mut a = Client::join_radio(&url, "radio3", "Ana").await;
+    a.add(
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        vec![track("aaaaaaaaaaa", Some(200_000))],
+    )
+    .await;
+    let st = a.wait_state("loading", |s| s.waiting_for_ready).await;
+    a.send(ClientMsg::Ended {
+        version: st.playback.version,
+    })
+    .await;
+    a.wait_state("stopped", |s| s.playback.status == PlayStatus::Stopped)
+        .await;
+    a.send(ClientMsg::SetRadio { on: true }).await;
+    let (request_id, _) = radio_request(&mut a).await;
+    a.send(ClientMsg::AddResolved {
+        request_id,
+        tracks: vec![track("bbbbbbbbbbb", Some(200_000))],
+    })
+    .await;
+    let st = a
+        .wait_state("radio song loading", |s| {
+            s.queue.len() == 2 && s.playback.track_index == Some(1)
+        })
+        .await;
+    assert!(st.waiting_for_ready);
+}
+
+#[tokio::test]
+async fn radio_asks_the_next_member_when_one_is_silent_or_empty() {
+    let (url, _) = start(radio_cfg()).await;
+    let mut a = Client::join_radio(&url, "radio4", "Ana").await;
+    let mut b = Client::join_radio(&url, "radio4", "Bojan").await;
+    a.add(
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        vec![track("aaaaaaaaaaa", Some(200_000))],
+    )
+    .await;
+    a.wait_state("one song", |s| s.queue.len() == 1).await;
+    a.send(ClientMsg::SetRadio { on: true }).await;
+
+    // Whoever is asked first stays silent; the other one gets asked after the timeout.
+    let first_a = tokio::select! {
+        _ = radio_request(&mut a) => true,
+        _ = radio_request(&mut b) => false,
+    };
+    let asked_second = if first_a { &mut b } else { &mut a };
+    let (request_id, _) = radio_request(asked_second).await;
+    // An empty answer is not an error.
+    asked_second
+        .send(ClientMsg::AddResolved {
+            request_id,
+            tracks: vec![],
+        })
+        .await;
+    let msgs = asked_second.drain(Duration::from_millis(800)).await;
+    assert!(!msgs.iter().any(|m| matches!(m, ServerMsg::Error { .. })));
+    // Both were tried for this queue end: nobody is asked again.
+    assert!(!msgs.iter().any(is_radio_request));
 }

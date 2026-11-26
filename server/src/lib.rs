@@ -39,6 +39,9 @@ pub struct Config {
     pub idle_timeout: Duration,
     /// Max members per room.
     pub max_members: usize,
+    /// Radio: how long a member gets to answer `RadioRequest` before the
+    /// server asks the next one.
+    pub radio_timeout: Duration,
 }
 
 impl Default for Config {
@@ -53,6 +56,7 @@ impl Default for Config {
             ws_ping_interval: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(70),
             max_members: 50,
+            radio_timeout: Duration::from_secs(30),
         }
     }
 }

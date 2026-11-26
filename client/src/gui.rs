@@ -110,6 +110,8 @@ pub struct App {
     accent_at: Instant,
     /// The user's playlists and recommendations.
     lib: library_ui::LibraryUi,
+    /// Newer version on GitHub (checked once per start).
+    update: Option<crate::update::Shared>,
 }
 
 impl App {
@@ -121,6 +123,10 @@ impl App {
         let config = Config::load();
         let tools = Tools::discover();
         let video_host = crate::video_host::VideoHost::new(cc);
+        let update = (!fake_audio).then(|| {
+            crate::update::clean_up();
+            crate::update::start_check(notify.clone())
+        });
         let screen = if !fake_audio && deps::needed(&tools) {
             Screen::Deps(deps::start(tools.clone(), notify.clone()))
         } else {
@@ -160,6 +166,7 @@ impl App {
             accent_to: theme::ACCENT,
             accent_at: Instant::now(),
             lib: library_ui::LibraryUi::default(),
+            update,
             config,
             screen,
             connecting: false,
@@ -359,6 +366,7 @@ impl App {
             centered_card(ui, "connect_card", 420.0, |ui| {
                 brand_header(ui, s::APP_TITLE, s::CONNECT_HEADING);
                 ui.add_space(16.0);
+                self.update_ui(ui);
                 ui.add_enabled_ui(!self.connecting, |ui| {
                     let c = &mut self.config;
                     for (label, value, password, hint) in [
@@ -452,6 +460,61 @@ impl App {
             }
         } else if submit && !self.connecting {
             self.try_connect();
+        }
+    }
+
+    /// "New version" bar above the connect form: one click downloads it,
+    /// swaps the program and starts the new one.
+    fn update_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::update::Phase;
+        let Some(shared) = &self.update else { return };
+        let phase = shared.lock().unwrap().clone();
+        let mut install = None;
+        match &phase {
+            Phase::Checking | Phase::UpToDate => return,
+            Phase::Available(u) => {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(s::update_available(&u.tag)).color(theme::TEXT),
+                        )
+                        .wrap(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if primary_button(ui, None, s::UPDATE_BUTTON, vec2(110.0, 32.0), true)
+                            .clicked()
+                        {
+                            install = Some(u.clone());
+                        }
+                    });
+                });
+            }
+            Phase::Downloading { tag, done, total } => {
+                let frac = total.filter(|t| *t > 0).map(|t| *done as f32 / t as f32);
+                let percent = frac.map(|f| (f * 100.0).round() as u64);
+                ui.label(RichText::new(s::update_downloading(tag, percent)).color(theme::TEXT_DIM));
+                ui.add_space(4.0);
+                thin_bar(ui, frac.unwrap_or(0.0), theme::accent());
+            }
+            Phase::Installing(tag) => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(16.0).color(theme::accent()));
+                    ui.label(RichText::new(s::update_installing(tag)).color(theme::TEXT_DIM));
+                });
+            }
+            Phase::Restarting => {
+                ui.label(RichText::new(s::UPDATE_RESTARTING).color(theme::TEXT_DIM));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Phase::Failed(e) => {
+                error_box(ui, &s::update_failed(e));
+                ui.hyperlink_to(s::UPDATE_MANUAL, crate::update::RELEASES_PAGE);
+            }
+        }
+        ui.add_space(14.0);
+        if let Some(u) = install {
+            self.config.save();
+            crate::update::start_install(shared, u, self.notify.clone());
         }
     }
 
@@ -1269,6 +1332,15 @@ impl App {
             .clicked()
             {
                 self.send(Command::Shuffle);
+            }
+            // Older servers have no radio, so there is no switch.
+            if let Some(on) = room.radio {
+                if icons::toggle(ui, Icon::Radio, 36.0, on)
+                    .on_hover_text(if on { s::RADIO_ON } else { s::RADIO_OFF })
+                    .clicked()
+                {
+                    self.send(Command::SetRadio(!on));
+                }
             }
             if icons::ghost(ui, Icon::ListAdd, 36.0, has_track)
                 .on_hover_text(s::SAVE_TO_PLAYLIST)

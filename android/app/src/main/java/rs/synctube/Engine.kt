@@ -283,6 +283,9 @@ class Engine(
     fun shuffleUpcoming() = user { startShuffle() }
     fun clearQueue() = user { startClear() }
 
+    /** Room radio, for everyone in the room. */
+    fun setRadio(on: Boolean) = user { send(ClientMsg.SetRadio(on)) }
+
     fun setVolume(v: Int) {
         volume = v.coerceIn(0, 100)
         prefs.volume = volume
@@ -573,6 +576,26 @@ class Engine(
                 toast(m.message, true)
             }
             is ServerMsg.Rejected -> conn = ConnState.Rejected(m.message)
+            is ServerMsg.RadioRequest -> startRadio(m.requestId, m.seeds)
+        }
+    }
+
+    /**
+     * Radio: YouTube's mix of the newest seed (older ones when that finds
+     * nothing new); the songs not queued yet go back to the server.
+     */
+    private fun startRadio(requestId: Long, seeds: List<String>) {
+        val queued = room?.queue.orEmpty().map { it.youtubeId }.toSet()
+        scope.launch {
+            var tracks = emptyList<TrackInfo>()
+            for (seed in seeds.asReversed()) {
+                val songs = runCatching { resolver.mix(seed) }
+                    .onFailure { Log.w(TAG, "radio mix failed for $seed", it) }
+                    .getOrNull() ?: continue
+                tracks = radioPick(songs, queued)
+                if (tracks.isNotEmpty()) break
+            }
+            send(ClientMsg.AddResolved(requestId, tracks))
         }
     }
 
@@ -1297,4 +1320,15 @@ class Engine(
         private fun now() = SystemClock.elapsedRealtime()
         private fun ewma(old: Long, sample: Long) = (old * 3 + sample) / 4
     }
+}
+
+/** Radio adds at most this many songs at a time (the server caps it too). */
+internal const val RADIO_BATCH = 5
+
+/** The first songs of a mix that aren't queued yet, without repeats. */
+internal fun radioPick(songs: List<Song>, queued: Set<String>): List<TrackInfo> {
+    val seen = queued.toHashSet()
+    return songs.filter { seen.add(it.youtubeId) }
+        .take(RADIO_BATCH)
+        .map { TrackInfo(it.youtubeId, it.title, it.durationMs) }
 }

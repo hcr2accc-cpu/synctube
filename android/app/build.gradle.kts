@@ -27,8 +27,8 @@ android {
         applicationId = "rs.synctube"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.6.0"
+        versionCode = 8
+        versionName = "0.7.0"
         buildConfigField("String", "DEFAULT_SERVER_URL", "\"${serverUrl.replace("\"", "")}\"")
     }
 

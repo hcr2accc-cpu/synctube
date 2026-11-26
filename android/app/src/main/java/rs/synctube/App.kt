@@ -10,6 +10,8 @@ import javax.net.SocketFactory
 class App : Application() {
     lateinit var engine: Engine
         private set
+    lateinit var updater: Updater
+        private set
 
     override fun onCreate() {
         super.onCreate()
@@ -20,6 +22,7 @@ class App : Application() {
             .socketFactory(NoDelaySocketFactory())
             .build()
         engine = Engine(this, http, Prefs(this))
+        updater = Updater(this, http)
     }
 
     companion object {

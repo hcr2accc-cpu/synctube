@@ -65,6 +65,7 @@ import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Radio
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Tune
@@ -82,6 +83,7 @@ import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -122,6 +124,9 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -216,6 +221,7 @@ internal fun ConnectScreen(engine: Engine, s: UiState) {
                 .padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            UpdateBar()
             Field(room, { room = it }, S.ROOM, S.ROOM_HINT, enabled = !busy)
             val recent = prefs.recentRooms.filter { !it.equals(room.trim(), ignoreCase = true) }
             if (recent.isNotEmpty() && !busy) {
@@ -268,6 +274,49 @@ internal fun ConnectScreen(engine: Engine, s: UiState) {
         Spacer(Modifier.height(24.dp))
         Text(S.ABOUT, color = Pal.TEXT_FAINT, fontSize = 12.sp)
     }
+}
+
+/** "New version" bar above the connect form: one tap downloads it and opens the installer. */
+@Composable
+private fun UpdateBar() {
+    val updater = (LocalContext.current.applicationContext as? App)
+        ?.takeIf { runCatching { it.updater }.isSuccess }?.updater ?: return
+    val phase by updater.phase.collectAsState()
+    val uri = LocalUriHandler.current
+    @Composable
+    fun row(text: String, button: (() -> Unit)?) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(text, color = Pal.TEXT, fontSize = 14.sp, modifier = Modifier.weight(1f))
+            if (button != null) {
+                Spacer(Modifier.width(10.dp))
+                Button(onClick = button, shape = RoundedCornerShape(12.dp)) { Text(S.UPDATE_BUTTON) }
+            }
+        }
+    }
+    when (val p = phase) {
+        UpdatePhase.Checking, UpdatePhase.UpToDate -> return
+        is UpdatePhase.Available -> row(S.updateAvailable(p.update.tag)) { updater.install(p.update) }
+        is UpdatePhase.NeedsPermission -> row(S.UPDATE_PERMISSION) { updater.install(p.update) }
+        is UpdatePhase.Downloading -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            val frac = p.total?.takeIf { it > 0 }?.let { p.done.toFloat() / it }
+            Text(S.updateDownloading(p.tag, frac?.let { (it * 100).toInt() }), color = Pal.TEXT_DIM, fontSize = 14.sp)
+            if (frac != null) {
+                LinearProgressIndicator(progress = { frac }, color = Pal.ACCENT, modifier = Modifier.fillMaxWidth())
+            } else {
+                LinearProgressIndicator(color = Pal.ACCENT, modifier = Modifier.fillMaxWidth())
+            }
+        }
+        is UpdatePhase.Failed -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(S.updateFailed(p.message), color = Pal.BAD, fontSize = 14.sp)
+            Text(
+                S.UPDATE_MANUAL,
+                color = Pal.ACCENT,
+                fontSize = 14.sp,
+                modifier = Modifier.clickable { uri.openUri(Updater.RELEASES_PAGE) },
+            )
+        }
+    }
+    HorizontalDivider(color = Pal.BORDER)
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -630,6 +679,7 @@ private fun NowPlaying(engine: Engine, s: UiState, room: RoomState, saved: Set<S
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.weight(1f)) { StatusPill(s) }
+                room.radio?.let { on -> RadioButton(on) { engine.setRadio(!on) } }
                 SaveButton(track.youtubeId in saved) { lib.pick(track.toSong()) }
             }
         }
@@ -668,6 +718,27 @@ private fun NowPlaying(engine: Engine, s: UiState, room: RoomState, saved: Set<S
                 valueRange = 0f..100f,
                 colors = sliderColors(),
                 modifier = Modifier.weight(1f).height(32.dp),
+            )
+        }
+    }
+}
+
+/** The room's radio switch: lit in the accent while on. */
+@Composable
+private fun RadioButton(on: Boolean, onClick: () -> Unit) {
+    IconButton(onClick = onClick) {
+        Box(
+            Modifier
+                .size(36.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(if (on) Pal.ACCENT.copy(alpha = 0.16f) else Color.Transparent),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Rounded.Radio,
+                if (on) S.RADIO_ON else S.RADIO_OFF,
+                tint = if (on) Pal.ACCENT else Pal.TEXT_DIM,
+                modifier = Modifier.size(22.dp),
             )
         }
     }

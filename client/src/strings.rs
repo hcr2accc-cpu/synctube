@@ -116,6 +116,26 @@ pub const PASTE_HINT: &str =
 pub const SEARCH_QUEUE: &str = "Pretraži red…";
 pub const SHUFFLE: &str = "Izmešaj pesme koje tek dolaze";
 pub const SHUFFLE_STOP: &str = "Mešanje u toku — klik za prekid";
+pub const UPDATE_BUTTON: &str = "Ažuriraj";
+pub const UPDATE_RESTARTING: &str = "Pokrećem novu verziju.";
+pub const UPDATE_MANUAL: &str = "Skini je ručno";
+pub fn update_available(tag: &str) -> String {
+    format!("Stigla je nova verzija {tag}.")
+}
+pub fn update_downloading(tag: &str, percent: Option<u64>) -> String {
+    match percent {
+        Some(p) => format!("Skidam {tag}… {p} %"),
+        None => format!("Skidam {tag}…"),
+    }
+}
+pub fn update_installing(tag: &str) -> String {
+    format!("Instaliram {tag}…")
+}
+pub fn update_failed(e: &str) -> String {
+    format!("Ažuriranje nije uspelo: {e}")
+}
+pub const RADIO_OFF: &str = "Radio: kad red stane, sam dodajem slične pesme. Važi za celu sobu.";
+pub const RADIO_ON: &str = "Radio je uključen za celu sobu. Klik ga gasi.";
 pub const SHUFFLED: &str = "Pesme koje tek dolaze su izmešane";
 pub const CLEAR_QUEUE: &str = "Obriši sve pesme iz sobe";
 pub const CLEAR_STOP: &str = "Brisanje u toku — klik za prekid";

@@ -25,6 +25,7 @@ pub enum Icon {
     Shuffle,
     Trash,
     ListAdd,
+    Radio,
 }
 
 /// A framed button showing `icon`, `size` points square.
@@ -64,6 +65,23 @@ pub fn ghost(ui: &mut egui::Ui, icon: Icon, size: f32, enabled: bool) -> Respons
     } else {
         resp
     }
+}
+
+/// A borderless icon button for a switch: lit in the accent while on.
+pub fn toggle(ui: &mut egui::Ui, icon: Icon, size: f32, on: bool) -> Response {
+    if !on {
+        return ghost(ui, icon, size, true);
+    }
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
+    let fill = theme::accent_alpha(if resp.hovered() { 56 } else { 36 });
+    ui.painter().rect_filled(rect, 6.0, fill);
+    paint(
+        ui.painter(),
+        icon,
+        rect.shrink(size * 0.27),
+        theme::accent(),
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// The big round accent button (play/pause).
@@ -352,6 +370,24 @@ pub fn paint(painter: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
             let arm = w * 0.22;
             painter.line_segment([pos2(c.x - arm, c.y), pos2(c.x + arm, c.y)], thin);
             painter.line_segment([pos2(c.x, c.y - arm), pos2(c.x, c.y + arm)], thin);
+        }
+        Icon::Radio => {
+            // A mast with two waves on each side.
+            let thin = Stroke::new((w * 0.11).max(1.4), color);
+            let c = pos2(cx, cy - w * 0.08);
+            painter.circle_filled(c, w * 0.1, color);
+            painter.line_segment([c, pos2(cx, b)], thin);
+            for (radius, k) in [(w * 0.26, 0.55_f32), (w * 0.46, 0.6)] {
+                for side in [-1.0_f32, 1.0] {
+                    let pts: Vec<Pos2> = (0..=8)
+                        .map(|i| {
+                            let a = (i as f32 / 8.0 - 0.5) * k * std::f32::consts::PI;
+                            pos2(c.x + side * radius * a.cos(), c.y + radius * a.sin())
+                        })
+                        .collect();
+                    painter.add(Shape::line(pts, thin));
+                }
+            }
         }
         Icon::Gear => {
             let thin = Stroke::new((w * 0.13).max(1.4), color);

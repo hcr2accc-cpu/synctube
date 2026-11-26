@@ -19,5 +19,6 @@ pub mod proc;
 pub mod strings;
 pub mod theme;
 pub mod thumbs;
+pub mod update;
 pub mod video_host;
 pub mod ytdlp;

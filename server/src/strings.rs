@@ -14,6 +14,16 @@ pub const TOO_MANY_PENDING: &str = "Sačekaj da se prethodni linkovi učitaju.";
 pub const UNKNOWN_REQUEST: &str = "Zahtev za dodavanje je istekao, pokušaj ponovo.";
 pub const NOTHING_ADDED: &str = "Nijedna pesma nije dodata.";
 pub const SERVER_BUSY: &str = "Server je zauzet, pokušaj ponovo.";
+/// Shown as "added by" on songs the radio picked.
+pub const RADIO_ADDED_BY: &str = "Radio";
+
+pub fn radio_switched(name: &str, on: bool) -> String {
+    if on {
+        format!("{name} je uključio/la radio")
+    } else {
+        format!("{name} je isključio/la radio")
+    }
+}
 
 pub fn joined(name: &str) -> String {
     format!("{name} je ušao/la u sobu")

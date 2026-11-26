@@ -26,6 +26,7 @@ class MainActivity : ComponentActivity() {
         )
         if (savedInstanceState == null) takeShared(intent)
         val engine = App.instance.engine
+        App.instance.updater.check()
         setContent {
             SyncTubeTheme {
                 AppRoot(engine, shared.value) { shared.value = null }

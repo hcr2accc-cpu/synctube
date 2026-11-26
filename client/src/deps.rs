@@ -122,7 +122,7 @@ fn phase_of(r: &Result<PathBuf, String>) -> DepPhase {
     }
 }
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(20)))
         .timeout_recv_body(Some(Duration::from_secs(600)))
@@ -241,7 +241,7 @@ pub fn is_plain_mpv_asset(name: &str) -> bool {
 }
 
 /// Downloads to `dest` via a temporary file, reporting progress.
-fn download(
+pub(crate) fn download(
     agent: &ureq::Agent,
     url: &str,
     dest: &Path,
